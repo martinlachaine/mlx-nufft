@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below, and also cite the FINUFFT papers listed in NOTICE."
+title: "mlx-nufft: non-uniform FFTs (types 1/2/3, dims 1/2/3) on Apple GPUs via Metal/MLX"
+abstract: >-
+  An independent implementation of non-uniform fast Fourier transforms
+  (types 1, 2, and 3, in 1/2/3 dimensions) for Apple-silicon GPUs via
+  Metal/MLX, with a drop-in FINUFFT-compatible Python interface. Uses a
+  float32 execute pipeline with double precision confined to plan-time
+  coordinate setup, achieving fp64-grade accuracy (relative L2 ~1e-5) on
+  hardware without native double precision. Validated against CPU FINUFFT
+  and an exact direct-summation oracle. Algorithms follow FINUFFT/cuFINUFFT.
+type: software
+authors:
+  - family-names: Lachaine
+    given-names: Martin
+repository-code: "https://github.com/martinlachaine/mlx-nufft"
+url: "https://github.com/martinlachaine/mlx-nufft"
+license: Apache-2.0
+version: 0.1.0
+keywords:
+  - nufft
+  - nonuniform-fft
+  - apple-silicon
+  - metal
+  - mlx
+  - gpu

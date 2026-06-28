@@ -1,0 +1,28 @@
+mlx-nufft
+Copyright 2026 Martin Lachaine
+
+mlx-nufft is an independent implementation of non-uniform fast Fourier
+transforms (types 1, 2, 3, in 1/2/3 dimensions) for Apple GPUs via Metal/MLX.
+Its algorithms and internal structure follow the FINUFFT and cuFINUFFT
+libraries (Apache License 2.0, Copyright The Simons Foundation, Inc.) — the
+exponential-of-semicircle kernel, the spreading/deconvolution structure, and
+the type-3 construction — which were also used as the reference implementation
+and numerical oracle during development. mlx-nufft was written from the
+published methods with the FINUFFT source as a reference; it does not include
+or redistribute FINUFFT source code.
+
+If you use this software, please cite the underlying methods:
+
+  A. H. Barnett, J. Magland, and L. af Klinteberg, "A parallel nonuniform
+  fast Fourier transform library based on an exponential of semicircle
+  kernel," SIAM J. Sci. Comput. 41(5), C479-C504 (2019). arXiv:1808.06736
+
+  A. H. Barnett, "Aliasing error of the exp(beta sqrt(1-z^2)) kernel in the
+  nonuniform fast Fourier transform," Appl. Comput. Harmon. Anal. 51, 1-16
+  (2021). arXiv:2001.09405
+
+  Y. Shih, G. Wright, J. Anden, J. Blaschke, and A. H. Barnett, "cuFINUFFT:
+  a load-balanced GPU library for general-purpose nonuniform FFTs," PDSEC
+  (IPDPS workshops) 2021. arXiv:2102.08463
+
+FINUFFT: https://github.com/flatironinstitute/finufft

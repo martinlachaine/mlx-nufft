@@ -1,0 +1,25 @@
+[project]
+name = "mlx-nufft"
+version = "0.1.0"
+description = "Non-uniform FFTs (types 1/2/3, dims 1/2/3) on Apple GPUs via Metal/MLX"
+requires-python = ">=3.11"
+dependencies = [
+    # mlx pinned: this library works around version-specific Metal FFT
+    # behaviour (native lengths <=4096 / pow2; Bluestein otherwise).
+    # Re-validate harness/test_gpu_small.py before bumping.
+    "mlx==0.31.2",
+    "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "finufft==2.5.1",   # CPU oracle for validation/benchmarks
+    "scipy>=1.14",      # complex64 reference FFTs in diagnostics
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mlx_nufft"]

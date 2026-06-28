@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+results/
+research_scratch/
+harness/fft_backend_bench/VkFFT/
+harness/fft_backend_bench/*.o
+harness/fft_backend_bench/mpsgraph_fft
+harness/fft_backend_bench/vkfft_bench
+harness/fft_backend_bench/vkfft_verify
+harness/fft_backend_bench/mps_verify
+vkfft_bridge/VkFFT/
+vkfft_bridge/*.dylib
+perf_scratch/
