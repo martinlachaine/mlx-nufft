@@ -22,7 +22,16 @@ import mlx_nufft.gpu_t3 as g                                    # noqa: E402
 
 GATE = 1e-4
 FAILS = []
-SKIPS = []
+
+# Every case in this test deliberately builds multi-GB GPU buffers to exercise
+# the >2**31-element code paths, so the whole test targets a large GPU (an
+# M-series Max). Below this Metal max-buffer-size — a CI runner caps at
+# ~3.5 GiB — the cases do not fail cleanly: they either error at allocation or,
+# worse, hang the GPU and abort the process. So skip the entire test up front
+# (like the VkFFT backend test) rather than trying to catch the failure. The
+# largest single buffer these paths create stays just under 2**31 complex64
+# elements (~16 GiB); 24 GiB leaves margin while excluding small / CI GPUs.
+BIG_GRID_MIN_BUFFER = 24 * 2**30   # bytes
 
 
 def machine():
@@ -41,79 +50,59 @@ def check(label, err, gate=GATE):
         FAILS.append(label)
 
 
-# These cases deliberately build multi-GB GPU buffers to exercise the
-# >2**31-element code paths, and target an M-series Max. Below this Metal
-# max-buffer-size, attempting them does not fail cleanly — a small GPU (e.g. a
-# CI runner, which caps at ~3.5 GiB) either errors at allocation or, worse,
-# hangs the GPU and aborts the process. So gate them *before* any GPU work
-# rather than trying to catch the failure.
-BIG_GRID_MIN_BUFFER = 24 * 2**30   # bytes
-
-
-def big_grid_ok(label):
-    """True if this GPU can take the large-grid cases; else record a SKIP."""
-    import mlx.core as mx
-    cap = int(mx.device_info().get("max_buffer_length", 0))
-    if cap and cap < BIG_GRID_MIN_BUFFER:
-        print(f"  SKIP {label}: GPU max_buffer_length={cap / 2**30:.1f} GiB "
-              f"< {BIG_GRID_MIN_BUFFER // 2**30} GiB — needs an M-series Max")
-        SKIPS.append(label)
-        return False
-    return True
-
-
 if __name__ == "__main__":
     import mlx.core as mx
     print(f"machine: {machine()}")
-    print(f"GPU max_buffer_length: "
-          f"{int(mx.device_info().get('max_buffer_length', 0)) / 2**30:.1f} GiB")
+    cap = int(mx.device_info().get("max_buffer_length", 0))
+    print(f"GPU max_buffer_length: {cap / 2**30:.1f} GiB")
+
+    if cap and cap < BIG_GRID_MIN_BUFFER:
+        print(f"\nSKIP: these large type-3 cases need a GPU with "
+              f"max_buffer_length >= {BIG_GRID_MIN_BUFFER // 2**30} GiB "
+              f"(this GPU has {cap / 2**30:.1f} GiB) — run on an M-series Max.")
+        sys.exit(0)
+
     rng = np.random.default_rng(5)
 
     # ---- Test 1: large-grid type-3 single execute vs oracle ----
     # lat=2.0 -> n_up=[7200,7200,24]: padz z-major grid = 2.49e9 > 2^31
     # (handled by the z-chunked padz).
     print("\n[1] large-grid type-3 (n_up ~ 7200) single execute vs oracle")
-    if big_grid_ok("[1] large-grid type-3 (n_up~7200)"):
-        prob = gen_anisotropic(N=1024, P=40_000, lat=2.0)
-        x, c, s = prob["x"], prob["c"], prob["s"]
-        plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
-        print(f"    n_up={plan.n_up}  padz_elems={plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2:.3e}"
-              f" ({plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2/2**31:.2f}x 2^31)")
-        f = np.asarray(plan.execute(c))
-        idx = rng.choice(s[0].size, 12_000, replace=False)
-        fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
-        check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
-        del plan
-        mx.clear_cache()
+    prob = gen_anisotropic(N=1024, P=40_000, lat=2.0)
+    x, c, s = prob["x"], prob["c"], prob["s"]
+    plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
+    print(f"    n_up={plan.n_up}  padz_elems={plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2:.3e}"
+          f" ({plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2/2**31:.2f}x 2^31)")
+    f = np.asarray(plan.execute(c))
+    idx = rng.choice(s[0].size, 12_000, replace=False)
+    fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
+    check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
+    del plan
+    mx.clear_cache()
 
     # ---- Test 1b: very large grid — n_up beyond the spread ceiling (~9657).
     # lat=3.0 -> n_up=[10800,...]; only runs because the spread grid is
     # complex64-counted (an nf-grid of 1.5e9 floats would be 1.4x 2^31 as
     # float32). Correctness, not just non-crash.
     print("\n[1b] very large grid (n_up ~ 10800)")
-    if big_grid_ok("[1b] very large grid (n_up~10800)"):
-        prob = gen_anisotropic(N=1024, P=40_000, lat=3.0)
-        x, c, s = prob["x"], prob["c"], prob["s"]
-        plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
-        nf = plan.nf
-        print(f"    n_up={plan.n_up}  nf-grid float32 would be {nf[0]*nf[1]*nf[2]*2/2**31:.2f}x 2^31"
-              f" (complex64 {nf[0]*nf[1]*nf[2]/2**31:.2f}x)")
-        f = np.asarray(plan.execute(c))
-        idx = rng.choice(s[0].size, 10_000, replace=False)
-        fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
-        check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
-        del plan
-        mx.clear_cache()
+    prob = gen_anisotropic(N=1024, P=40_000, lat=3.0)
+    x, c, s = prob["x"], prob["c"], prob["s"]
+    plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
+    nf = plan.nf
+    print(f"    n_up={plan.n_up}  nf-grid float32 would be {nf[0]*nf[1]*nf[2]*2/2**31:.2f}x 2^31"
+          f" (complex64 {nf[0]*nf[1]*nf[2]/2**31:.2f}x)")
+    f = np.asarray(plan.execute(c))
+    idx = rng.choice(s[0].size, 10_000, replace=False)
+    fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
+    check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
+    del plan
+    mx.clear_cache()
 
     # ---- Test 2: execute_batch (several transforms, one plan) vs oracle ----
-    # exercises BOTH the small fused path and the large fallback path. The
-    # small-fused case runs everywhere; the large-fallback case is gated like
-    # the cases above.
+    # exercises BOTH the small fused path and the large fallback path.
     for tag, lat, P in [("small fused", 0.75, 100_000),
                         ("large fallback", 2.0, 40_000)]:
         print(f"\n[2:{tag}] execute_batch (nch=3) vs per-transform oracle")
-        if tag == "large fallback" and not big_grid_ok(f"[2:{tag}] execute_batch"):
-            continue
         prob = gen_anisotropic(N=1024, P=P, lat=lat)
         x, c, s = prob["x"], prob["c"], prob["s"]
         g._SLAB_THRESHOLD = min(g._SLAB_THRESHOLD, 1.0e9)   # force slab path
@@ -132,7 +121,5 @@ if __name__ == "__main__":
         del plan
         mx.clear_cache()
 
-    skip_note = f" ({len(SKIPS)} skipped: too large for this GPU)" if SKIPS else ""
-    print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURES: {FAILS}'}"
-          f"{skip_note}")
+    print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURES: {FAILS}'}")
     sys.exit(0 if not FAILS else 1)
