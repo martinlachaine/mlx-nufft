@@ -41,73 +41,79 @@ def check(label, err, gate=GATE):
         FAILS.append(label)
 
 
-def run_or_skip(label, fn):
-    """Execute fn() for a large-grid case; if the GPU's Metal max-buffer-size
-    is too small to hold the buffers it needs (small / CI GPUs cap far below an
-    M-series Max), record a SKIP instead of a failure. These cases target an
-    M-series Max with ample RAM; the gate still applies wherever they run."""
-    try:
-        return fn()
-    except RuntimeError as e:
-        msg = str(e)
-        if "malloc" in msg or "buffer size" in msg or "out of memory" in msg:
-            import mlx.core as mx
-            cap = mx.device_info().get("max_buffer_length", 0) / 2**30
-            print(f"  SKIP {label}: GPU buffer too small "
-                  f"(max_buffer_length={cap:.1f} GiB) — needs an M-series Max")
-            SKIPS.append(label)
-            return None
-        raise
+# These cases deliberately build multi-GB GPU buffers to exercise the
+# >2**31-element code paths, and target an M-series Max. Below this Metal
+# max-buffer-size, attempting them does not fail cleanly — a small GPU (e.g. a
+# CI runner, which caps at ~3.5 GiB) either errors at allocation or, worse,
+# hangs the GPU and aborts the process. So gate them *before* any GPU work
+# rather than trying to catch the failure.
+BIG_GRID_MIN_BUFFER = 24 * 2**30   # bytes
+
+
+def big_grid_ok(label):
+    """True if this GPU can take the large-grid cases; else record a SKIP."""
+    import mlx.core as mx
+    cap = int(mx.device_info().get("max_buffer_length", 0))
+    if cap and cap < BIG_GRID_MIN_BUFFER:
+        print(f"  SKIP {label}: GPU max_buffer_length={cap / 2**30:.1f} GiB "
+              f"< {BIG_GRID_MIN_BUFFER // 2**30} GiB — needs an M-series Max")
+        SKIPS.append(label)
+        return False
+    return True
 
 
 if __name__ == "__main__":
+    import mlx.core as mx
     print(f"machine: {machine()}")
+    print(f"GPU max_buffer_length: "
+          f"{int(mx.device_info().get('max_buffer_length', 0)) / 2**30:.1f} GiB")
     rng = np.random.default_rng(5)
 
     # ---- Test 1: large-grid type-3 single execute vs oracle ----
     # lat=2.0 -> n_up=[7200,7200,24]: padz z-major grid = 2.49e9 > 2^31
     # (handled by the z-chunked padz).
     print("\n[1] large-grid type-3 (n_up ~ 7200) single execute vs oracle")
-    prob = gen_anisotropic(N=1024, P=40_000, lat=2.0)
-    x, c, s = prob["x"], prob["c"], prob["s"]
-    plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
-    print(f"    n_up={plan.n_up}  padz_elems={plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2:.3e}"
-          f" ({plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2/2**31:.2f}x 2^31)")
-    f = run_or_skip(f"type-3 n_up={plan.n_up} single execute",
-                    lambda: np.asarray(plan.execute(c)))
-    if f is not None:
+    if big_grid_ok("[1] large-grid type-3 (n_up~7200)"):
+        prob = gen_anisotropic(N=1024, P=40_000, lat=2.0)
+        x, c, s = prob["x"], prob["c"], prob["s"]
+        plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
+        print(f"    n_up={plan.n_up}  padz_elems={plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2:.3e}"
+              f" ({plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2/2**31:.2f}x 2^31)")
+        f = np.asarray(plan.execute(c))
         idx = rng.choice(s[0].size, 12_000, replace=False)
         fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
         check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
-    del plan
-    import mlx.core as mx
-    mx.clear_cache()
+        del plan
+        mx.clear_cache()
 
     # ---- Test 1b: very large grid — n_up beyond the spread ceiling (~9657).
     # lat=3.0 -> n_up=[10800,...]; only runs because the spread grid is
     # complex64-counted (an nf-grid of 1.5e9 floats would be 1.4x 2^31 as
     # float32). Correctness, not just non-crash.
     print("\n[1b] very large grid (n_up ~ 10800)")
-    prob = gen_anisotropic(N=1024, P=40_000, lat=3.0)
-    x, c, s = prob["x"], prob["c"], prob["s"]
-    plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
-    nf = plan.nf
-    print(f"    n_up={plan.n_up}  nf-grid float32 would be {nf[0]*nf[1]*nf[2]*2/2**31:.2f}x 2^31"
-          f" (complex64 {nf[0]*nf[1]*nf[2]/2**31:.2f}x)")
-    f = run_or_skip(f"type-3 n_up={plan.n_up} single execute",
-                    lambda: np.asarray(plan.execute(c)))
-    if f is not None:
+    if big_grid_ok("[1b] very large grid (n_up~10800)"):
+        prob = gen_anisotropic(N=1024, P=40_000, lat=3.0)
+        x, c, s = prob["x"], prob["c"], prob["s"]
+        plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
+        nf = plan.nf
+        print(f"    n_up={plan.n_up}  nf-grid float32 would be {nf[0]*nf[1]*nf[2]*2/2**31:.2f}x 2^31"
+              f" (complex64 {nf[0]*nf[1]*nf[2]/2**31:.2f}x)")
+        f = np.asarray(plan.execute(c))
         idx = rng.choice(s[0].size, 10_000, replace=False)
         fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
         check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
-    del plan
-    mx.clear_cache()
+        del plan
+        mx.clear_cache()
 
     # ---- Test 2: execute_batch (several transforms, one plan) vs oracle ----
-    # exercises BOTH the small fused path and the large fallback path.
+    # exercises BOTH the small fused path and the large fallback path. The
+    # small-fused case runs everywhere; the large-fallback case is gated like
+    # the cases above.
     for tag, lat, P in [("small fused", 0.75, 100_000),
                         ("large fallback", 2.0, 40_000)]:
         print(f"\n[2:{tag}] execute_batch (nch=3) vs per-transform oracle")
+        if tag == "large fallback" and not big_grid_ok(f"[2:{tag}] execute_batch"):
+            continue
         prob = gen_anisotropic(N=1024, P=P, lat=lat)
         x, c, s = prob["x"], prob["c"], prob["s"]
         g._SLAB_THRESHOLD = min(g._SLAB_THRESHOLD, 1.0e9)   # force slab path
@@ -116,15 +122,13 @@ if __name__ == "__main__":
                        c * (0.5 + 0.5j),
                        (rng.standard_normal(c.size)
                         + 1j * rng.standard_normal(c.size))]).astype(np.complex64)
-        fb = run_or_skip(f"{tag} execute_batch",
-                         lambda: np.asarray(plan.execute_batch(cs)))
-        if fb is not None:
-            assert fb.shape == (3, s[0].size), fb.shape
-            idx = rng.choice(s[0].size, 8_000, replace=False)
-            for ch in range(3):
-                fd = direct_sum_mp(x, cs[ch], s, isign=+1, idx=idx)
-                check(f"{tag} ch{ch} batch vs oracle",
-                      rel_l2(np.asarray(fb[ch])[idx], fd))
+        fb = np.asarray(plan.execute_batch(cs))
+        assert fb.shape == (3, s[0].size), fb.shape
+        idx = rng.choice(s[0].size, 8_000, replace=False)
+        for ch in range(3):
+            fd = direct_sum_mp(x, cs[ch], s, isign=+1, idx=idx)
+            check(f"{tag} ch{ch} batch vs oracle",
+                  rel_l2(np.asarray(fb[ch])[idx], fd))
         del plan
         mx.clear_cache()
 
