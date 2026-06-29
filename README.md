@@ -2,6 +2,7 @@
 
 [![tests](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml/badge.svg)](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mlx-nufft.svg)](https://pypi.org/project/mlx-nufft/)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21018763.svg)](https://doi.org/10.5281/zenodo.21018763)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-Apple%20silicon-lightgrey.svg)](#install)
