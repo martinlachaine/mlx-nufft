@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Usage questions and examples
+    url: https://github.com/martinlachaine/mlx-nufft#usage
+    about: See the README usage section and examples/quickstart.py before opening an issue.
+  - name: Method, accuracy, and benchmarks
+    url: https://github.com/martinlachaine/mlx-nufft/blob/main/mlx-nufft.pdf
+    about: The technical report covers the crit64 precision model, accuracy study, and limitations.

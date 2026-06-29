@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.1.1 — 2026-06-28
+
+Documentation and infrastructure only — no library or numerical behavior
+changes (the `mlx_nufft` package is identical to v0.1.0).
+
+- Continuous integration: the correctness suite runs on Apple-silicon GitHub
+  runners (`.github/workflows/ci.yml`); large type-3 cases that need a big-GPU
+  Metal buffer skip cleanly on small/CI GPUs.
+- `harness/run_tests.py`: one-command runner for the full correctness suite.
+- `examples/quickstart.py`: runnable, dependency-light demo that self-checks
+  accuracy against an exact direct DFT.
+- README: copy-pasteable quickstart, "verify the install" section, status
+  badges, and a "Development and validation" note.
+- `CONTRIBUTING.md` and GitHub issue templates.
+
 ## v0.1.0 — 2026-06-28
 
 Initial public release. Non-uniform FFTs (types 1/2/3, dimensions 1/2/3) for

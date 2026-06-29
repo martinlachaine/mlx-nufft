@@ -1,0 +1,55 @@
+name: Bug report
+description: Report incorrect results, a crash, or unexpected behavior.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. mlx-nufft runs on Apple-silicon (Metal/MLX);
+        please include the details below so the issue can be reproduced.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead? For accuracy issues, give the relative-L2 error against a reference (CPU `finufft` or a direct sum) and the `eps` you requested.
+      placeholder: |
+        Expected nufft2d1 to match finufft to ~1e-6 at eps=1e-6, but got rel-L2 = 3e-2.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: The smallest self-contained snippet that shows the problem. It will be rendered as Python.
+      render: python
+      placeholder: |
+        import numpy as np, mlx_nufft as finufft
+        x = np.random.default_rng(0).uniform(-np.pi, np.pi, 1000)
+        c = np.random.default_rng(1).standard_normal(1000) + 0j
+        fk = finufft.nufft1d1(x, c, 64, eps=1e-6)
+        # ...
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and OS
+      description: Apple chip and macOS version.
+      placeholder: "Apple M2 Pro, macOS 15.4"
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Output of `pip show mlx-nufft mlx | grep -i version` plus your Python version.
+      placeholder: "mlx-nufft 0.1.1, mlx 0.31.2, Python 3.13"
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Full traceback, the failing line from `harness/run_tests.py`, or other context.
+    validations:
+      required: false
