@@ -1,5 +1,11 @@
 # mlx-nufft — non-uniform FFTs on Apple GPUs (Metal/MLX)
 
+[![tests](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml/badge.svg)](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![Platform](https://img.shields.io/badge/platform-Apple%20silicon-lightgrey.svg)](#install)
+[![Backend: MLX](https://img.shields.io/badge/backend-MLX%200.31.2-orange.svg)](https://github.com/ml-explore/mlx)
+
 mlx-nufft computes non-uniform fast Fourier transforms — types 1, 2 and 3, in
 dimensions 1, 2 and 3 — on Apple-silicon GPUs via Metal/MLX, with a drop-in
 mirror of the `finufft` Python API. It runs an fp32 GPU pipeline with the
@@ -30,6 +36,43 @@ and `scipy` as references:
 git clone https://github.com/martinlachaine/mlx-nufft && cd mlx-nufft
 uv venv --python 3.13 .venv
 uv pip install -p .venv/bin/python -e ".[dev]"
+```
+
+Verify the install — run the full correctness suite (each test compares against
+CPU `finufft` and/or an exact direct-summation oracle):
+
+```bash
+.venv/bin/python harness/run_tests.py
+```
+
+It prints a per-test pass/fail summary and exits non-zero on any failure. The
+optional VkFFT backend test reports `SKIP` unless the bridge in
+`vkfft_bridge/` is built.
+
+## Quickstart
+
+A complete, copy-paste-runnable 2-D type-1 transform (M nonuniform points →
+`N1 × N2` uniform Fourier modes):
+
+```python
+import numpy as np
+import mlx_nufft as finufft
+
+rng = np.random.default_rng(0)
+M, N1, N2 = 100_000, 256, 256
+x = rng.uniform(-np.pi, np.pi, M)                          # coords in [-pi, pi)
+y = rng.uniform(-np.pi, np.pi, M)
+c = rng.standard_normal(M) + 1j * rng.standard_normal(M)   # source strengths
+
+fk = finufft.nufft2d1(x, y, c, (N1, N2), eps=1e-6)         # -> (256, 256) complex
+```
+
+A fuller runnable script (basic call, plan reuse, and a self-check against an
+exact direct DFT — no `finufft` install needed) is in
+[`examples/quickstart.py`](examples/quickstart.py):
+
+```bash
+python examples/quickstart.py
 ```
 
 ## Usage
@@ -100,8 +143,11 @@ the bridge is built.
   (`Type1PlanND`/`Type2PlanND`), `types12.py`, `dfmath.py` (the `expi` /
   double-single primitive), `sizing.py` (kernel/grid sizing), `api.py` (the
   `finufft`-compatible surface), `vkfft_backend.py`.
-- `harness/` — correctness tests, the acceptance/benchmark runner, and the
-  CPU-reference oracle.
+- `examples/` — runnable, dependency-light usage examples
+  (`quickstart.py`).
+- `harness/` — correctness tests (`test_*.py`), the suite runner
+  (`run_tests.py`), the acceptance/benchmark runner, and the CPU-reference
+  oracle.
 - `vkfft_bridge/` — optional VkFFT-Metal backend build.
 
 ## License & citation
