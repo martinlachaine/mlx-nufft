@@ -1,6 +1,7 @@
 # mlx-nufft — non-uniform FFTs on Apple GPUs (Metal/MLX)
 
 [![tests](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml/badge.svg)](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/mlx-nufft.svg)](https://pypi.org/project/mlx-nufft/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/platform-Apple%20silicon-lightgrey.svg)](#install)
@@ -20,11 +21,16 @@ double precision.
 
 ## Install
 
-Requires an Apple-silicon Mac (Metal/MLX). Install the release directly from
-GitHub (not yet on PyPI):
+Requires an Apple-silicon Mac (Metal/MLX).
 
 ```bash
-pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.1.0"
+pip install mlx-nufft
+```
+
+Or pin a tagged release straight from GitHub:
+
+```bash
+pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.1.1"
 ```
 
 then `import mlx_nufft`. Dependencies are pinned (notably `mlx==0.31.2`).
