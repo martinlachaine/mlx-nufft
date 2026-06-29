@@ -30,7 +30,7 @@ pip install mlx-nufft
 Or pin a tagged release straight from GitHub:
 
 ```bash
-pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.1.1"
+pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.1.2"
 ```
 
 then `import mlx_nufft`. Dependencies are pinned (notably `mlx==0.31.2`).

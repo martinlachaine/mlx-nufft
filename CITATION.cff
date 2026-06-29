@@ -16,7 +16,7 @@ authors:
 repository-code: "https://github.com/martinlachaine/mlx-nufft"
 url: "https://github.com/martinlachaine/mlx-nufft"
 license: Apache-2.0
-version: 0.1.1
+version: 0.1.2
 date-released: 2026-06-28
 keywords:
   - nufft

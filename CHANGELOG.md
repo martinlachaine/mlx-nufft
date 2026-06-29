@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.2 — 2026-06-28
+
+Documentation and packaging only — no library or numerical behavior changes.
+
+- Published to PyPI: `pip install mlx-nufft`.
+- README install section updated to lead with PyPI, plus a PyPI version badge.
+- First release published through the Trusted Publishing workflow on release.
+
 ## v0.1.1 — 2026-06-28
 
 Documentation and infrastructure only — no library or numerical behavior
