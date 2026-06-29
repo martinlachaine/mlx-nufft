@@ -150,6 +150,22 @@ the bridge is built.
   oracle.
 - `vkfft_bridge/` — optional VkFFT-Metal backend build.
 
+## Development and validation
+
+mlx-nufft is AI-assisted, human-directed research software. Its scope, numerical
+requirements, validation strategy, acceptance criteria, and release decisions
+are the author's; generative AI tools accelerated implementation, refactoring,
+test scaffolding, and documentation.
+
+Generated code was not trusted by default. Every component was validated against
+independent references — CPU FINUFFT, exact direct-summation oracles on small
+problems, transform-convention and adjoint checks, full dimension/type coverage,
+dtype/device behavior, and API-parity tests (see `harness/`).
+
+The author is responsible for the released software — its design, limitations,
+and maintenance. Known limitations and hardware assumptions are documented;
+corrections are welcome via the issue tracker.
+
 ## License & citation
 
 Apache-2.0 (see `LICENSE`). mlx-nufft is an independent implementation that
