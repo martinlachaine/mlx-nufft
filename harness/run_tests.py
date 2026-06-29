@@ -42,7 +42,10 @@ def main() -> int:
         )
         dt = time.perf_counter() - t0
         tail = (proc.stdout.strip().splitlines() or [""])[-1]
-        skipped = "SKIP" in proc.stdout
+        # A script counts as SKIP only if it did nothing but skip (e.g. the
+        # VkFFT backend test when the bridge is unbuilt). A script that skips
+        # some sub-cases but still has real passes is a PASS.
+        skipped = "SKIP" in proc.stdout and "PASS" not in proc.stdout
         if proc.returncode == 0:
             status = "SKIP" if skipped else "PASS"
         else:

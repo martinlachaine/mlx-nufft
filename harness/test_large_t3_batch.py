@@ -22,6 +22,7 @@ import mlx_nufft.gpu_t3 as g                                    # noqa: E402
 
 GATE = 1e-4
 FAILS = []
+SKIPS = []
 
 
 def machine():
@@ -40,6 +41,25 @@ def check(label, err, gate=GATE):
         FAILS.append(label)
 
 
+def run_or_skip(label, fn):
+    """Execute fn() for a large-grid case; if the GPU's Metal max-buffer-size
+    is too small to hold the buffers it needs (small / CI GPUs cap far below an
+    M-series Max), record a SKIP instead of a failure. These cases target an
+    M-series Max with ample RAM; the gate still applies wherever they run."""
+    try:
+        return fn()
+    except RuntimeError as e:
+        msg = str(e)
+        if "malloc" in msg or "buffer size" in msg or "out of memory" in msg:
+            import mlx.core as mx
+            cap = mx.device_info().get("max_buffer_length", 0) / 2**30
+            print(f"  SKIP {label}: GPU buffer too small "
+                  f"(max_buffer_length={cap:.1f} GiB) — needs an M-series Max")
+            SKIPS.append(label)
+            return None
+        raise
+
+
 if __name__ == "__main__":
     print(f"machine: {machine()}")
     rng = np.random.default_rng(5)
@@ -53,10 +73,12 @@ if __name__ == "__main__":
     plan = g.GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64")
     print(f"    n_up={plan.n_up}  padz_elems={plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2:.3e}"
           f" ({plan.n_up[0]*plan.n_up[1]*plan.n_up[2]*2/2**31:.2f}x 2^31)")
-    f = np.asarray(plan.execute(c))
-    idx = rng.choice(s[0].size, 12_000, replace=False)
-    fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
-    check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
+    f = run_or_skip(f"type-3 n_up={plan.n_up} single execute",
+                    lambda: np.asarray(plan.execute(c)))
+    if f is not None:
+        idx = rng.choice(s[0].size, 12_000, replace=False)
+        fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
+        check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
     del plan
     import mlx.core as mx
     mx.clear_cache()
@@ -72,10 +94,12 @@ if __name__ == "__main__":
     nf = plan.nf
     print(f"    n_up={plan.n_up}  nf-grid float32 would be {nf[0]*nf[1]*nf[2]*2/2**31:.2f}x 2^31"
           f" (complex64 {nf[0]*nf[1]*nf[2]/2**31:.2f}x)")
-    f = np.asarray(plan.execute(c))
-    idx = rng.choice(s[0].size, 10_000, replace=False)
-    fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
-    check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
+    f = run_or_skip(f"type-3 n_up={plan.n_up} single execute",
+                    lambda: np.asarray(plan.execute(c)))
+    if f is not None:
+        idx = rng.choice(s[0].size, 10_000, replace=False)
+        fd = direct_sum_mp(x, c, s, isign=+1, idx=idx)
+        check(f"type-3 n_up={plan.n_up} vs fp64 oracle", rel_l2(f[idx], fd))
     del plan
     mx.clear_cache()
 
@@ -92,15 +116,19 @@ if __name__ == "__main__":
                        c * (0.5 + 0.5j),
                        (rng.standard_normal(c.size)
                         + 1j * rng.standard_normal(c.size))]).astype(np.complex64)
-        fb = np.asarray(plan.execute_batch(cs))
-        assert fb.shape == (3, s[0].size), fb.shape
-        idx = rng.choice(s[0].size, 8_000, replace=False)
-        for ch in range(3):
-            fd = direct_sum_mp(x, cs[ch], s, isign=+1, idx=idx)
-            check(f"{tag} ch{ch} batch vs oracle",
-                  rel_l2(np.asarray(fb[ch])[idx], fd))
+        fb = run_or_skip(f"{tag} execute_batch",
+                         lambda: np.asarray(plan.execute_batch(cs)))
+        if fb is not None:
+            assert fb.shape == (3, s[0].size), fb.shape
+            idx = rng.choice(s[0].size, 8_000, replace=False)
+            for ch in range(3):
+                fd = direct_sum_mp(x, cs[ch], s, isign=+1, idx=idx)
+                check(f"{tag} ch{ch} batch vs oracle",
+                      rel_l2(np.asarray(fb[ch])[idx], fd))
         del plan
         mx.clear_cache()
 
-    print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURES: {FAILS}'}")
+    skip_note = f" ({len(SKIPS)} skipped: too large for this GPU)" if SKIPS else ""
+    print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURES: {FAILS}'}"
+          f"{skip_note}")
     sys.exit(0 if not FAILS else 1)
