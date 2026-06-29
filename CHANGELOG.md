@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.3 — 2026-06-28
+
+Infrastructure only — no library or numerical behavior changes. First release
+archived on Zenodo, giving the project a citable DOI.
+
 ## v0.1.2 — 2026-06-28
 
 Documentation and packaging only — no library or numerical behavior changes.

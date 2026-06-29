@@ -38,7 +38,7 @@ def vkfft_available():
     return vkfft_backend.available()
 
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 __all__ = ["Type3Plan", "Type1Plan", "Type2Plan",
            "Type1PlanND", "Type2PlanND", "Plan",
            "nufft1d1", "nufft1d2", "nufft1d3",

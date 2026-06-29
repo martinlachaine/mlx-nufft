@@ -1,6 +1,6 @@
 [project]
 name = "mlx-nufft"
-version = "0.1.2"
+version = "0.1.3"
 description = "Non-uniform FFTs (types 1/2/3, dims 1/2/3) on Apple GPUs via Metal/MLX"
 readme = "README.md"
 requires-python = ">=3.11"
