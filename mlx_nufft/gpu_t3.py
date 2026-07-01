@@ -28,11 +28,15 @@ PI = np.pi
 
 
 def _es_msl(prefix, w, beta):
+    # fast::exp2/fast::sqrt: ~1e-6 relative kernel error, below the fp32
+    # pipeline floor (measured end-to-end 1.70e-6 vs 1.55e-6 rel-L2 at
+    # eps=1e-6), and meaningfully cheaper per tap than the precise:: forms.
+    log2e = 1.4426950408889634
     return f"""
 inline float {prefix}_es(float d) {{
     float z = d * {2.0 / w}f;
     float t = metal::max(1.0f - z * z, 0.0f);
-    return metal::precise::exp({beta}f * (metal::precise::sqrt(t) - 1.0f));
+    return metal::fast::exp2({beta * log2e}f * (metal::fast::sqrt(t) - 1.0f));
 }}
 """
 
