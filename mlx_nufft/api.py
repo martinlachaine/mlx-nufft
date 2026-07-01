@@ -52,7 +52,7 @@ def _check_opts(kwargs):
     if upsampfac in (0, 0.0):                 # finufft auto sentinel
         upsampfac = None
     prec = opts.pop("prec", "crit64")
-    fft_backend = opts.pop("fft_backend", "mlx")   # type-3 slab only
+    fft_backend = opts.pop("fft_backend", "mlx")   # type-3 only
     for k in list(opts):
         if k in _IGNORED_OPTS:
             opts.pop(k)
@@ -142,7 +142,7 @@ def _modes_tuple(n_modes, dim, out, out_offset=0):
 def _warn_no_vkfft(fft_backend, what):
     if fft_backend != "mlx":
         warnings.warn(f"mlx-nufft: fft_backend={fft_backend!r} applies only "
-                      f"to 3D type-3 (slab); ignored for {what}")
+                      f"to type 3; ignored for {what}")
 
 
 def _nufft_t1(dim, coords, c, n_modes, out, eps, isign, kwargs):

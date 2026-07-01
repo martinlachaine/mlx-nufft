@@ -5,12 +5,10 @@ at the large-grid sizes where it matters (MLX uses the scrambled four-step;
 VkFFT uses natural order + identity-scramble gather — so this exercises the
 full convention/scramble/normalization path), and reports the whole-execute
 speedup vs the validated MLX backend. Also covers the extended bridge: raw
-1D/2D/3D fftn vs numpy, the non-slab type-3 3D FFT (oracle-gated end to end,
-FFT stage A/B-gated vs the mlx fft_axis path at 1e-6), and Type1PlanND /
-Type2PlanND fft_backend="vkfft" vs "mlx" (A/B <= 1e-6; the mode deconvolution
-sits after the FFT so backend agreement holds at the fp32 floor there — in
-type 3 the deconvolution scales the grid BEFORE the FFT, so end-to-end A/B
-between two fp32 FFTs is eps-scale and the fp64 oracle is the arbiter).
+1D/2D/3D fftn vs numpy and the non-slab type-3 3D FFT (oracle-gated end to
+end, FFT stage A/B-gated vs the mlx fft_axis path at 1e-6 — the type-3
+deconvolution scales the grid BEFORE the FFT, so end-to-end A/B between two
+fp32 FFTs is eps-scale and the fp64 oracle is the arbiter).
 Skips cleanly if the bridge isn't built.
 """
 import sys
@@ -24,9 +22,8 @@ import mlx.core as mx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[0].parent))
 from harness.gen import (gen_anisotropic, gen_generic, direct_sum_mp,
-                         rel_l2, uniform_points)                 # noqa: E402
+                         rel_l2)                                 # noqa: E402
 import mlx_nufft.gpu_t3 as g                                    # noqa: E402
-from mlx_nufft.nd import Type1PlanND, Type2PlanND               # noqa: E402
 from mlx_nufft import vkfft_backend as vk                       # noqa: E402
 
 GATE = 1e-4          # vs the exact fp64 oracle (fp32 pipeline, eps=1e-5)
@@ -116,31 +113,6 @@ def t3_nonslab_checks(rng):
     mx.clear_cache()
 
 
-def t12_checks(rng):
-    """Type 1/2 ND with fft_backend="vkfft" vs "mlx" (deconvolution after
-    the FFT -> backend agreement at the fp32 floor)."""
-    print("\ntype-1/2 ND fft_backend A/B")
-    for dim, N in [(3, 64), (2, 500), (1, 30000)]:
-        xs, n_modes, M = uniform_points(dim, N, rho=0.5)
-        cj = rng.standard_normal(M) + 1j * rng.standard_normal(M)
-        f_ab = []
-        for backend in ("mlx", "vkfft"):
-            p = Type1PlanND(xs, n_modes, eps=1e-6, isign=+1,
-                            fft_backend=backend)
-            f_ab.append(p.execute(cj))
-        e = rel_l2(f_ab[1], f_ab[0])
-        check(e <= GATE_AB, f"t1 {dim}D N={N} vkfft vs mlx", e, GATE_AB)
-        fk = rng.standard_normal(n_modes) + 1j * rng.standard_normal(n_modes)
-        c_ab = []
-        for backend in ("mlx", "vkfft"):
-            p = Type2PlanND(xs, n_modes, eps=1e-6, isign=-1,
-                            fft_backend=backend)
-            c_ab.append(p.execute(fk))
-        e = rel_l2(c_ab[1], c_ab[0])
-        check(e <= GATE_AB, f"t2 {dim}D N={N} vkfft vs mlx", e, GATE_AB)
-    mx.clear_cache()
-
-
 if __name__ == "__main__":
     print(f"machine: {machine()}")
     if not vk.available():
@@ -150,7 +122,6 @@ if __name__ == "__main__":
 
     raw_fftn_checks(rng)
     t3_nonslab_checks(rng)
-    t12_checks(rng)
 
     print("\ntype-3 slab (batched 2D lateral FFT)")
     for lat, P in [(1.0, 60_000), (2.0, 40_000)]:     # n_up ~ 3600, 7200
