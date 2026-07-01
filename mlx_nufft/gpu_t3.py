@@ -95,6 +95,21 @@ def _split_n(n):
     return best
 
 
+def _is_native(n):
+    return n <= _FFT_NATIVE_MAX or ((n & (n - 1)) == 0 and n <= _FFT_POW2_MAX)
+
+
+def _split_native(n):
+    """Four-step split for the slab fast path; (n, 1) for native lengths.
+
+    Both encodings make the scramble map i -> (i % n1)*n2 + i//n1 the
+    identity when no split happens ((n,1): i%n == i, i//n == 0).
+    """
+    if _is_native(n):
+        return (n, 1)
+    return _split_n(n)
+
+
 def fft_axis(H, axis, inverse, twiddle_cache=None):
     """(i)FFT along one axis; four-step Cooley-Tukey for long non-pow2 axes.
 
@@ -418,6 +433,7 @@ class GpuT3Plan:
                 *self.mx_ti1, *self.mx_tfr, *self.mx_dec)
 
         self._twiddles = {}
+        self._twt_kernels = {}
 
         def _scram(n):
             if n <= _FFT_NATIVE_MAX or (n & (n - 1)) == 0:
@@ -791,6 +807,66 @@ class GpuT3Plan:
             output_names=["accout"], header="#include <metal_math>\n" + es2,
             source=gslab_src)
 
+        # full-Z gather: whole z window per target against the FFT'd z-major
+        # grid (complex64) in ONE launch — replaces nu3 accumulating
+        # _gather_slab launches (no acc ping-pong). Valid when the full Z
+        # fits one metal_kernel buffer and nu3 >= w2 (each z tap maps to a
+        # distinct slab, matching the per-slab tap selection). Layout is
+        # (l3, r1, r2) with r1 in NATURAL order for both backends (keeps a
+        # target's window inside ~w2*nu2 contiguous bytes; a scrambled r1
+        # would scatter it across ~w2 * n2 * nu2-strides) and r2 natural
+        # (vkfft) or four-step-scrambled (mlx, see _lateral_fft_block).
+        scrB = ((nu2, 1) if self.fft_backend == "vkfft"
+                else _split_native(nu2))
+        self._scrB_full = scrB
+        gfull_src = f"""
+    uint kk = thread_position_in_grid.x;
+    if (kk >= {self.M}u) return;
+    float wx[{w2}], wy[{w2}], wz[{w2}];
+    int jx[{w2}], jy[{w2}], jz[{w2}];
+    float fx = tfrx[kk], fy = tfry[kk], fz = tfrz[kk];
+    int x0 = ti1x[kk], y0 = ti1y[kk], z0 = ti1z[kk];
+    for (int t = 0; t < {w2}; ++t) {{
+        wx[t] = k2_es((float)t - fx);
+        wy[t] = k2_es((float)t - fy);
+        wz[t] = k2_es((float)t - fz);
+        int a = x0 + t; a -= {nu1} * (a >= {nu1}); a += {nu1} * (a < 0);
+        jx[t] = a;
+        int b = y0 + t; b -= {nu2} * (b >= {nu2}); b += {nu2} * (b < 0);
+        jy[t] = (b % {scrB[0]}) * {scrB[1]} + b / {scrB[0]};
+        int cz = z0 + t; cz -= {nu3} * (cz >= {nu3}); cz += {nu3} * (cz < 0);
+        jz[t] = cz;
+    }}
+    float accre = 0.0f, accim = 0.0f;
+    for (int lz = 0; lz < {w2}; ++lz) {{
+        size_t sl = (size_t)jz[lz] * {nu1 * nu2};
+        float sre = 0.0f, sim = 0.0f;
+        for (int lx = 0; lx < {w2}; ++lx) {{
+            size_t base = sl + (size_t)jx[lx] * {nu2};
+            float pre = 0.0f, pim = 0.0f;
+            for (int ly = 0; ly < {w2}; ++ly) {{
+                float wv = wy[ly];
+                size_t idx = base + (size_t)jy[ly];
+                pre = metal::fma(v[idx].real, wv, pre);
+                pim = metal::fma(v[idx].imag, wv, pim);
+            }}
+            sre = metal::fma(pre, wx[lx], sre);
+            sim = metal::fma(pim, wx[lx], sim);
+        }}
+        accre = metal::fma(sre, wz[lz], accre);
+        accim = metal::fma(sim, wz[lz], accim);
+    }}
+    float pre_ = post[2*kk], pim_ = post[2*kk+1];
+    out[2*kk]   = accre * pre_ - accim * pim_;
+    out[2*kk+1] = accre * pim_ + accim * pre_;
+"""
+        self._gather_slab_full = mx.fast.metal_kernel(
+            name=f"t3gatherslabfull_{self.fft_backend}",
+            input_names=["v", "ti1x", "ti1y", "ti1z",
+                         "tfrx", "tfry", "tfrz", "post"],
+            output_names=["out"], header="#include <metal_math>\n" + es2,
+            source=gfull_src)
+
     # ------------------------------------------------------------------
     def _build_batch_kernels(self, nch):
         """Batched (multi-channel) variants of spread/padz/gather_slab.
@@ -940,7 +1016,58 @@ class GpuT3Plan:
                          "tfrx", "tfry", "tfrz"],
             output_names=["accout"], header="#include <metal_math>\n" + es2,
             source=gslab_src)
-        return dict(spread=spread, padz=padz, gslab=gslab)
+
+        # batched full-Z gather: one launch, whole z window per target over
+        # the FFT'd (ch, l3, nu1, nu2) block; postphase stays outside (as in
+        # the per-slab batch path). Requires nu3 >= w2.
+        gfull_src = f"""
+    uint kk = thread_position_in_grid.x;
+    if (kk >= {self.M}u) return;
+    float wx[{w2}], wy[{w2}], wz[{w2}];
+    int jx[{w2}], jy[{w2}], jz[{w2}];
+    float fx = tfrx[kk], fy = tfry[kk], fz = tfrz[kk];
+    int x0 = ti1x[kk], y0 = ti1y[kk], z0 = ti1z[kk];
+    for (int t = 0; t < {w2}; ++t) {{
+        wx[t] = k2_es((float)t - fx);
+        wy[t] = k2_es((float)t - fy);
+        wz[t] = k2_es((float)t - fz);
+        int a = x0 + t; a -= {nu1} * (a >= {nu1}); a += {nu1} * (a < 0);
+        jx[t] = (a % {self.scramA[0]}) * {self.scramA[1]} + a / {self.scramA[0]};
+        int b = y0 + t; b -= {nu2} * (b >= {nu2}); b += {nu2} * (b < 0);
+        jy[t] = (b % {self.scramB[0]}) * {self.scramB[1]} + b / {self.scramB[0]};
+        int cz = z0 + t; cz -= {nu3} * (cz >= {nu3}); cz += {nu3} * (cz < 0);
+        jz[t] = cz;
+    }}
+    float sre[{nch}], sim[{nch}];
+    for (int ch = 0; ch < {nch}; ++ch) {{ sre[ch] = 0.0f; sim[ch] = 0.0f; }}
+    for (int lz = 0; lz < {w2}; ++lz) {{
+        size_t sl = (size_t)jz[lz] * {nu1 * nu2};
+        for (int lx = 0; lx < {w2}; ++lx) {{
+            size_t base = sl + (size_t)jx[lx] * {nu2};
+            float wxz = wx[lx] * wz[lz];
+            for (int ly = 0; ly < {w2}; ++ly) {{
+                float wv = wy[ly] * wxz;
+                size_t idx = base + (size_t)jy[ly];
+                for (int ch = 0; ch < {nch}; ++ch) {{
+                    size_t off = ((size_t)ch * {nu3 * nu1 * nu2} + idx) * 2;
+                    sre[ch] = metal::fma(vk[off], wv, sre[ch]);
+                    sim[ch] = metal::fma(vk[off + 1], wv, sim[ch]);
+                }}
+            }}
+        }}
+    }}
+    for (int ch = 0; ch < {nch}; ++ch) {{
+        out[(kk*{nch}+ch)*2]   = sre[ch];
+        out[(kk*{nch}+ch)*2+1] = sim[ch];
+    }}
+"""
+        gfull = mx.fast.metal_kernel(
+            name=f"t3gatherslabfullb{nch}",
+            input_names=["vk", "ti1x", "ti1y", "ti1z",
+                         "tfrx", "tfry", "tfrz"],
+            output_names=["out"], header="#include <metal_math>\n" + es2,
+            source=gfull_src)
+        return dict(spread=spread, padz=padz, gslab=gslab, gfull=gfull)
 
     def execute_batch(self, cs, return_np=True):
         """Batched transform of nch strength channels through one plan.
@@ -1011,29 +1138,47 @@ class GpuT3Plan:
         _trim()
 
         Zc = mx.view(Z, dtype=mx.complex64).reshape(nch, nu3, nu1, nu2)
-        acc = mx.zeros((self.M * nch * 2,), dtype=mx.float32)
-        mx.eval(acc)
         inv = self.isign > 0
-        for kz in range(nu3):
-            vk = Zc[:, kz]                          # (nch, nu1, nu2)
-            vk, sB = fft_axis_scrambled(vk, 2, inverse=inv,
-                                        twiddle_cache=self._twiddles)
-            assert sB == self.scramB
-            vk = fft_axis(vk, 1, inverse=inv,
-                          twiddle_cache=self._twiddles)
-            vkf = mx.view(mx.contiguous(vk), dtype=mx.float32).reshape(-1)
-            kzbuf = mx.array(np.array([kz], dtype=np.int32))
-            acc = K["gslab"](
-                inputs=[vkf, acc, kzbuf, self.mx_ti1[0], self.mx_ti1[1],
-                        self.mx_ti1[2], self.mx_tfr[0], self.mx_tfr[1],
-                        self.mx_tfr[2]],
+        if (not self.low_mem and nu3 >= self.w2
+                and self.fft_backend == "mlx"):
+            # whole-block lateral FFT over all channels and slabs (channels
+            # fold into the flat leading dim), then one full-Z gather launch
+            # — no per-slab serialization. Same (.., r1, sB) layout as the
+            # per-slab loop (self.scramB and _scrB_full agree as index maps).
+            Zf = self._lateral_fft_block(Zc.reshape(-1), nb=nch)
+            vkf = mx.view(Zf, dtype=mx.float32).reshape(-1)
+            del Zf
+            acc = K["gfull"](
+                inputs=[vkf, self.mx_ti1[0], self.mx_ti1[1], self.mx_ti1[2],
+                        self.mx_tfr[0], self.mx_tfr[1], self.mx_tfr[2]],
                 output_shapes=[(self.M * nch * 2,)],
                 output_dtypes=[mx.float32],
                 grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
-            del vk, vkf
             mx.eval(acc)
-            if self.low_mem and kz % 6 == 5:
-                mx.clear_cache()
+            del vkf
+        else:
+            acc = mx.zeros((self.M * nch * 2,), dtype=mx.float32)
+            mx.eval(acc)
+            for kz in range(nu3):
+                vk = Zc[:, kz]                          # (nch, nu1, nu2)
+                vk, sB = fft_axis_scrambled(vk, 2, inverse=inv,
+                                            twiddle_cache=self._twiddles)
+                assert sB == self.scramB
+                vk = fft_axis(vk, 1, inverse=inv,
+                              twiddle_cache=self._twiddles)
+                vkf = mx.view(mx.contiguous(vk), dtype=mx.float32).reshape(-1)
+                kzbuf = mx.array(np.array([kz], dtype=np.int32))
+                acc = K["gslab"](
+                    inputs=[vkf, acc, kzbuf, self.mx_ti1[0], self.mx_ti1[1],
+                            self.mx_ti1[2], self.mx_tfr[0], self.mx_tfr[1],
+                            self.mx_tfr[2]],
+                    output_shapes=[(self.M * nch * 2,)],
+                    output_dtypes=[mx.float32],
+                    grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
+                del vk, vkf
+                mx.eval(acc)
+                if self.low_mem and kz % 6 == 5:
+                    mx.clear_cache()
         del Zc, Z
 
         out = mx.view(acc.reshape(self.M, nch, 2),
@@ -1153,13 +1298,137 @@ class GpuT3Plan:
         self._padz_chunks[kzc] = k
         return k
 
+    def _get_twt(self, n1, n2, R):
+        """Fused twiddle-multiply + transpose for one four-step axis:
+        A (L, n2, R, n1) -> B (L, n1, R, n2) = transpose(A * T), T (n2, n1),
+        all complex64 (R=1 for a last-axis four-step; R carries the trailing
+        dims of a middle-axis one). Tiled threadgroup transpose: load (over
+        n1) and store (over n2) are both unit-stride; replaces fft_axis's
+        separate multiply and contiguous-transpose passes (~28 ms vs ~59 ms
+        at L, n1, n2 = 24*5400, 72, 75).
+        grid=(ceil(n1/32)*32, ceil(n2/32)*32, L*R), threadgroup=(32, 32, 1).
+        """
+        k = self._twt_kernels.get((n1, n2, R))
+        if k is not None:
+            return k
+        src = f"""
+    threadgroup float2 tile[32][33];
+    uint3 tg = threadgroup_position_in_grid;
+    uint3 tl = thread_position_in_threadgroup;
+    size_t l = tg.z / {R};
+    size_t r = tg.z % {R};
+    int f1 = (int)(tg.x * 32 + tl.x);
+    int k2 = (int)(tg.y * 32 + tl.y);
+    if (f1 < {n1} && k2 < {n2}) {{
+        size_t ia = ((l * {n2} + k2) * {R} + r) * {n1} + f1;
+        size_t it = (size_t)k2 * {n1} + f1;
+        float ar = A[ia].real, ai = A[ia].imag;
+        float tr = T[it].real, ti = T[it].imag;
+        tile[tl.y][tl.x] = float2(ar*tr - ai*ti, ar*ti + ai*tr);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int f1s = (int)(tg.x * 32 + tl.y);
+    int k2s = (int)(tg.y * 32 + tl.x);
+    if (f1s < {n1} && k2s < {n2}) {{
+        float2 v = tile[tl.x][tl.y];
+        device float* Bf = (device float*) B;
+        size_t ib = ((l * {n1} + f1s) * {R} + r) * {n2} + k2s;
+        Bf[2*ib] = v.x; Bf[2*ib+1] = v.y;
+    }}
+"""
+        k = mx.fast.metal_kernel(
+            name=f"t3twt_{n1}_{n2}_{R}", input_names=["A", "T"],
+            output_names=["B"], source=src)
+        self._twt_kernels[(n1, n2, R)] = k
+        return k
+
+    def _twiddle_arr(self, n, inverse):
+        """Four-step twiddle table T[k2, f1] for length n; shares the
+        (n, sgn)-keyed cache with fft_axis (identical construction)."""
+        n1, n2 = _split_n(n)
+        sgn = +1.0 if inverse else -1.0
+        key = (n, sgn)
+        T = self._twiddles.get(key)
+        if T is None:
+            k2 = np.arange(n2, dtype=np.float64)[:, None]
+            f1 = np.arange(n1, dtype=np.float64)[None, :]
+            T = mx.array(np.exp(sgn * 2j * PI * f1 * k2 / n)
+                         .astype(np.complex64))
+            self._twiddles[key] = T
+        return T
+
+    def _lateral_fft_block(self, Z, nb=1):
+        """Whole-block lateral FFT for the full-Z fast path, ~9 grid passes
+        vs ~11 for per-slab fft_axis calls: the fused twiddle-transpose
+        kernel replaces each axis's separate multiply + contiguous-transpose,
+        and the axis-1 four-step carries nu2 as a trailing dim instead of
+        transposing it away and back. Axis 1 comes out NATURAL, axis 2
+        scrambled (absorbed by the full-Z gather via _scrB_full): the
+        scrambled axis must be the unit-stride one — scrambling the
+        nu2-strided axis would scatter each gather window across
+        ~w2 * n2B * nu2-stride bytes (measured 4x slower gather).
+
+        In: Z flat complex64 (nb*nu3*nu1*nu2), z-major (.., l3, r1, r2); nb
+        is a leading batch dim (execute_batch channels; 1 for execute).
+        Out: (nb*nu3, nu1, nu2) as (.., l3, f1-natural, sB-scrambled).
+        """
+        nu1, nu2, _ = self.n_up
+        nl = nb * self.n_up[2]       # leading dims are flat for lateral FFTs
+        inv = self.isign > 0
+        fft1 = mx.fft.ifft if inv else mx.fft.fft
+        n1B, n2B = self._scrB_full
+
+        def _twt(X, L, n1, n2, R, n):
+            return self._get_twt(n1, n2, R)(
+                inputs=[X, self._twiddle_arr(n, inv)],
+                output_shapes=[(L * n1 * n2 * R,)],
+                output_dtypes=[mx.complex64],
+                grid=(-(-n1 // 32) * 32, -(-n2 // 32) * 32, L * R),
+                threadgroup=(32, 32, 1))[0]
+
+        # axis 2 (nu2, last): four-step scrambled, or native
+        if n2B == 1:
+            X = fft1(Z.reshape(nl, nu1, nu2), axis=2)
+        else:
+            X = mx.contiguous(mx.transpose(
+                Z.reshape(nl, nu1, n1B, n2B), (0, 1, 3, 2)))
+            mx.eval(X)
+            X = fft1(X, axis=3)                               # k1B -> f1B
+            mx.eval(X)
+            X = _twt(X, nl * nu1, n1B, n2B, 1, nu2)
+            X = fft1(X.reshape(nl, nu1, n1B, n2B), axis=3)    # k2B -> f2B
+        mx.eval(X)                                            # (l3, r1, sB)
+        # axis 1 (nu1, middle): full four-step, natural output
+        if _is_native(nu1):
+            X = fft1(X.reshape(nl, nu1, nu2), axis=1)
+        else:
+            n1A, n2A = _split_n(nu1)
+            X = mx.contiguous(mx.transpose(
+                X.reshape(nl, n1A, n2A, nu2), (0, 2, 3, 1)))
+            mx.eval(X)                                        # (l3,k2A,sB,k1A)
+            X = fft1(X, axis=3)                               # k1A -> f1A
+            mx.eval(X)
+            X = _twt(X, nl, n1A, n2A, nu2, nu1)               # (l3,f1A,sB,k2A)
+            X = fft1(X.reshape(nl, n1A, nu2, n2A), axis=3)    # k2A -> f2A
+            mx.eval(X)
+            # un-scramble axis 1: (l3, f1A, sB, f2A) -> (l3, f2A, f1A, sB)
+            X = mx.contiguous(mx.transpose(X, (0, 3, 1, 2)))
+        mx.eval(X)
+        return X.reshape(nl, nu1, nu2)
+
     def _execute_slab(self, c, return_np=True):
-        """Slab pipeline: fused pad+zDFT, per-z-slab lateral FFTs, gather
-        accumulated over slabs. Peak memory ~ nf-grid + z-major inner grid
-        + one slab, instead of 2x the full inner grid. At large lateral grids
-        the z-major grid exceeds the metal_kernel 2**31-element limit, so padz
-        is produced in z-chunks (each under the limit); results are identical
-        to the single-call path at sizes where the latter fits."""
+        """Slab pipeline: fused pad+zDFT, lateral FFTs, gather.
+
+        Fast path (low_mem False, full Z under the metal_kernel cap): the
+        lateral FFT runs over the WHOLE z-major block (_lateral_fft_block,
+        or VkFFT's batched fft2) and one full-Z gather launch covers every
+        target's complete z window — no per-slab serialization.
+        Otherwise (low_mem, or z-chunked at large lateral grids where the
+        z-major grid exceeds the metal_kernel 2**31-element limit): per-slab
+        lateral FFTs with accumulating gathers, peak memory ~ nf-grid +
+        z-major inner grid + one slab. Results agree across paths to within
+        spread-atomic reordering noise (bit-identical downstream of the
+        spread grid)."""
         w = self.w
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
@@ -1220,6 +1489,26 @@ class GpuT3Plan:
             mx.eval(Zblk)
             _vk.fft2_inplace(Zblk, vk_inv, vk_norm)
 
+        def _gather_full(vall):
+            # vall: FFT'd z-major grid (nu3, nu1, nu2) complex64, contiguous.
+            out = self._gather_slab_full(
+                inputs=[vall, self.mx_ti1[0], self.mx_ti1[1], self.mx_ti1[2],
+                        self.mx_tfr[0], self.mx_tfr[1], self.mx_tfr[2],
+                        self.mx_post.reshape(-1)],
+                output_shapes=[(self.M * 2,)],
+                output_dtypes=[mx.float32],
+                grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
+            return mx.view(out, dtype=mx.complex64)
+
+        # full-Z gather requires each z tap to map to a distinct slab
+        # (always true in practice: nu3 >= nf3 >= 2w; only a sigma_inner
+        # w2 > nf3 corner could break it)
+        full_ok = nu3 >= self.w2
+        # mlx fast path: whole-block _lateral_fft_block + full-Z gather. Its
+        # transient four-step buffers are ~2 extra grid-size allocations —
+        # the low_mem path keeps the per-slab loop instead.
+        use_ft = (not vkfft) and (not self.low_mem) and full_ok
+        res = None
         dec = [self.mx_dec[0], self.mx_dec[1], self.mx_dec[2]]
         twf = self.mx_tw.reshape(-1)
         if nu3 * nu1 * nu2 <= _MK_MAX_ELEMS:
@@ -1236,19 +1525,31 @@ class GpuT3Plan:
             mx.eval(Z)
             if self.low_mem:
                 mx.clear_cache()
-            Zc = Z.reshape(nu3, nu1, nu2)
             if vkfft:
+                Zc = Z.reshape(nu3, nu1, nu2)
                 _fft_block_vkfft(Zc)             # all nu3 slabs at once, in place
-                for kz in range(nu3):            # chain gathers; eval once (the
-                    acc = _gather_one(Zc[kz], kz, acc)   # VkFFT sync already
-                mx.eval(acc)                     # drained the queue)
+                if full_ok:
+                    res = _gather_full(Zc)       # one launch over all targets
+                    mx.eval(res)
+                else:
+                    for kz in range(nu3):        # chain gathers; eval once (the
+                        acc = _gather_one(Zc[kz], kz, acc)  # VkFFT sync already
+                    mx.eval(acc)                 # drained the queue)
+                del Zc
+            elif use_ft:
+                Zf = self._lateral_fft_block(Z)
+                del Z
+                res = _gather_full(Zf)
+                mx.eval(res)
+                del Zf
             else:
+                Zc = Z.reshape(nu3, nu1, nu2)
                 for kz in range(nu3):
                     acc = _slab(Zc[kz], kz, acc)
                     mx.eval(acc)
                     if self.low_mem and kz % 6 == 5:
                         mx.clear_cache()
-            del Zc, Z
+                del Zc
         else:
             # z-chunked padz (complex64): each call writes <= _MK_MAX_ELEMS
             # complex elements.
@@ -1282,8 +1583,9 @@ class GpuT3Plan:
                     mx.clear_cache()
             del bf
 
-        res = mx.view(acc, dtype=mx.complex64) * self.mx_post_c
-        mx.eval(res)
+        if res is None:      # per-slab paths: postphase applied here
+            res = mx.view(acc, dtype=mx.complex64) * self.mx_post_c
+            mx.eval(res)
         if return_np:
             return np.array(res)
         return res
