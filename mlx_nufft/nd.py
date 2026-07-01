@@ -247,21 +247,6 @@ class _PointsND:
                 f"{var} -= {nu} * ({var} >= {nu});  "
                 f"{var} += {nu} * ({var} < 0);\n")
 
-    def _grid_index_guard(self, names, dims):
-        """Thread-position reads + bounds guard for an ND output box.
-
-        Metal grid axes are (x, y, z) = (last dim, ..., first dim) so the
-        fastest-varying output index rides the x lane.
-        """
-        s = ""
-        gax = ["x", "y", "z"]
-        for i, name in enumerate(reversed(names)):
-            s += (f"    uint {name} = "
-                  f"thread_position_in_grid.{gax[i]};\n")
-        conds = " || ".join(f"{n} >= {d}u" for n, d in zip(names, dims))
-        s += f"    if ({conds}) return;\n"
-        return s
-
     def _tg_for(self, gx):
         tx = min(int(gx), 256)
         return (tx, max(1, 256 // tx), 1)
@@ -413,16 +398,50 @@ class Type1PlanND(_PointsND):
         # execute_disjoint. Built eagerly only when it is the chosen spreader.
         self._spread = None if self._od else self._build_gm_spread()
 
-        # ---- crop FFT-order fine grid to mode box + deconvolve -----------
-        mnames = [f"m{d + 1}" for d in range(dim)]
-        src = self._grid_index_guard(mnames, N)
-        for d in range(dim):
-            src += (f"    int q{d + 1} = (int)m{d + 1} - {N[d] // 2};  "
-                    f"int r{d + 1} = q{d + 1} + {nu[d]} * (q{d + 1} < 0);\n")
-        src += (f"    size_t src = "
-                f"{_linearize([f'r{d + 1}' for d in range(dim)], nu)};\n")
+        # in-band FFT-order rows per axis, in modeord order (negative block
+        # first): gather indices for the progressive crop (axes 1..dim-1;
+        # axis 0 is cropped by the fused _crop kernel below).
+        self._mx_cropidx = [
+            mx.array(np.concatenate([
+                np.arange(nu[d] - N[d] // 2, nu[d]),
+                np.arange(N[d] - N[d] // 2)]).astype(np.int32))
+            for d in range(dim)]
+
+        # ---- final axis-0 crop + deconvolve (fused) ----------------------
+        # _fft_modes delivers the grid as (B, N[1], .., N[dim-1], nu[0]):
+        # every axis but 0 already cropped to modeord order, axis 0 still
+        # full-length FFT-order on the contiguous last position. One pass
+        # gathers the in-band axis-0 rows and applies the separable mode
+        # deconvolution. The batch index rides the spare grid slot (dim 3
+        # folds b*N[0]+m1 into z), so one kernel serves any batch size.
+        if dim == 3:
+            src = f"""
+    uint m3 = thread_position_in_grid.x;
+    uint m2 = thread_position_in_grid.y;
+    uint zz = thread_position_in_grid.z;
+    if (m3 >= {N[2]}u || m2 >= {N[1]}u) return;
+    uint b = zz / {N[0]}u;  uint m1 = zz % {N[0]}u;
+"""
+        elif dim == 2:
+            src = f"""
+    uint m2 = thread_position_in_grid.x;
+    uint m1 = thread_position_in_grid.y;
+    uint b = thread_position_in_grid.z;
+    if (m2 >= {N[1]}u || m1 >= {N[0]}u) return;
+"""
+        else:
+            src = f"""
+    uint m1 = thread_position_in_grid.x;
+    uint b = thread_position_in_grid.y;
+    if (m1 >= {N[0]}u) return;
+"""
+        src += (f"    int q1 = (int)m1 - {N[0] // 2};  "
+                f"int r1 = q1 + {nu[0]} * (q1 < 0);\n")
+        vnames = ["b"] + [f"m{d + 1}" for d in range(1, dim)] + ["r1"]
+        vdims = [0] + [N[d] for d in range(1, dim)] + [nu[0]]
+        src += f"    size_t src = {_linearize(vnames, vdims)};\n"
         src += (f"    size_t dst = "
-                f"{_linearize(mnames, N)};\n")
+                f"{_linearize(['b'] + [f'm{d + 1}' for d in range(dim)], [0] + list(N))};\n")
         src += ("    float d = "
                 + " * ".join(f"dec{d + 1}[m{d + 1}]" for d in range(dim))
                 + ";\n")
@@ -578,10 +597,51 @@ class Type1PlanND(_PointsND):
             output_names=["grid"], header="#include <metal_math>\n" + es,
             source=src, atomic_outputs=True)
 
-    def execute(self, c, return_np=True):
+    def _crop_launch(self, B):
+        N = self.N
+        if self.dim == 3:
+            g = (N[2], N[1], B * N[0])
+        elif self.dim == 2:
+            g = (N[1], N[0], B)
+        else:
+            g = (N[0], B, 1)
+        return g, self._tg_for(g[0])
+
+    def _fft_modes(self, H):
+        """Progressive FFT+crop: (*n_up) or (B, *n_up) grid -> (*N) / (B, *N)
+        deconvolved modes (lazy).
+
+        After axis d's FFT only its N[d] in-band rows survive, so crop axis d
+        before FFT-ing the next axis — FFT work drops to
+        (1 + 1/sigma + ... + 1/sigma^(dim-1))/dim of the full-grid chain. Each
+        FFT runs on the contiguous LAST axis (MLX's native path); the crop
+        gather also cycles the axes so the next axis lands last, replacing
+        MLX's internal strided-axis transpose round-trips. The axis-0 crop is
+        folded into the deconvolution kernel (_crop)."""
         dim = self.dim
-        nu_tot = int(np.prod(self.n_up))
+        inv = self.isign > 0
+        nb = H.ndim - dim                     # 0 or 1 leading batch axes
+        B = int(H.shape[0]) if nb else 1
+        cyc = tuple(range(nb)) + (nb + dim - 1,) \
+            + tuple(range(nb, nb + dim - 1))
+        H = fft_axis(H, H.ndim - 1, inverse=inv, twiddle_cache=self._twiddles)
+        for ax in range(dim - 1, 0, -1):
+            H = mx.take(mx.transpose(H, cyc), self._mx_cropidx[ax], axis=nb)
+            H = fft_axis(H, H.ndim - 1, inverse=inv,
+                         twiddle_cache=self._twiddles)
+        vf = mx.view(H, dtype=mx.float32).reshape(-1)
         N_tot = int(np.prod(self.N))
+        g, tg = self._crop_launch(B)
+        fk = self._crop(
+            inputs=[vf] + self.mx_dec,
+            output_shapes=[(B * N_tot * 2,)],
+            output_dtypes=[mx.float32],
+            grid=g, threadgroup=tg)[0]
+        out = mx.view(fk, dtype=mx.complex64)
+        return out.reshape(B, *self.N) if nb else out.reshape(*self.N)
+
+    def execute(self, c, return_np=True):
+        nu_tot = int(np.prod(self.n_up))
         cmx = mx.array(np.asarray(c).astype(np.complex64)) \
             if not isinstance(c, mx.array) else c
         if cmx.size != self.P:
@@ -610,17 +670,9 @@ class Type1PlanND(_PointsND):
                 threadgroup=(lanes, max(1, 1024 // lanes), 1),
                 init_value=0)[0]
         mx.eval(bf)
-        H = self._fft_grid(bf)
+        res = self._fft_modes(
+            mx.view(bf, dtype=mx.complex64).reshape(*self.n_up))
         del bf
-        vf = mx.view(H, dtype=mx.float32).reshape(-1)
-        gdims = tuple(reversed(self.N)) + (1,) * (3 - dim)
-        fk = self._crop(
-            inputs=[vf] + self.mx_dec,
-            output_shapes=[(N_tot * 2,)],
-            output_dtypes=[mx.float32],
-            grid=gdims, threadgroup=self._tg_for(gdims[0]))[0]
-        del H, vf
-        res = mx.view(fk, dtype=mx.complex64).reshape(*self.N)
         mx.eval(res)
         return np.array(res) if return_np else res
 
@@ -752,11 +804,8 @@ class Type1PlanND(_PointsND):
         if cs.ndim != 2 or cs.shape[1] != self.P:
             raise ValueError(f"cs must have shape (B, {self.P})")
         Btot = int(cs.shape[0])
-        dim = self.dim
         nu_tot = int(np.prod(self.n_up))
-        N_tot = int(np.prod(self.N))
         lanes = self._lanes
-        gdims = tuple(reversed(self.N)) + (1,) * (3 - dim)
         Bchunk = max(1, (2**31 - 1) // (nu_tot * 2))     # grid output int32 cap
         Cm = mx.array(np.ascontiguousarray(cs).astype(np.complex64))   # (Btot, P)
         Csort = mx.take(Cm, self.mx_perm, axis=1)        # plan (sort) order
@@ -775,21 +824,13 @@ class Type1PlanND(_PointsND):
                 threadgroup=(lanes, max(1, 1024 // lanes), 1),
                 init_value=0)[0]
             mx.eval(bf)
-            bfc = mx.view(bf, dtype=mx.complex64).reshape(B, *self.n_up)
+            # whole-chunk per-axis FFTs (leading batch dim) + progressive crop
+            ob = self._fft_modes(
+                mx.view(bf, dtype=mx.complex64).reshape(B, *self.n_up))
             del bf
-            for b in range(B):
-                H = bfc[b]
-                for ax in range(dim - 1, -1, -1):
-                    H = fft_axis(H, ax, inverse=self.isign > 0,
-                                 twiddle_cache=self._twiddles)
-                vf = mx.view(H, dtype=mx.float32).reshape(-1)
-                fk = self._crop(
-                    inputs=[vf] + self.mx_dec,
-                    output_shapes=[(N_tot * 2,)], output_dtypes=[mx.float32],
-                    grid=gdims, threadgroup=self._tg_for(gdims[0]))[0]
-                outs.append(mx.view(fk, dtype=mx.complex64).reshape(*self.N))
-            del bfc
-        res = mx.stack(outs)
+            mx.eval(ob)
+            outs.append(ob)
+        res = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
         mx.eval(res)
         return np.array(res) if return_np else res
 
@@ -820,7 +861,6 @@ class Type1PlanND(_PointsND):
         dim, lanes = self.dim, self._lanes
         nu_tot = int(np.prod(self.n_up))
         N_tot = int(np.prod(self.N))
-        gdims = tuple(reversed(self.N)) + (1,) * (3 - dim)
         gsort = groups[self.perm]                # labels in plan (perm) order
         c_sorted = mx.take(cmx, self.mx_perm)
         outs = []
@@ -841,15 +881,11 @@ class Type1PlanND(_PointsND):
                 threadgroup=(lanes, max(1, 1024 // lanes), 1),
                 init_value=0)[0]
             mx.eval(bf)
-            H = self._fft_grid(bf)
+            fk = self._fft_modes(
+                mx.view(bf, dtype=mx.complex64).reshape(*self.n_up))
             del bf
-            vf = mx.view(H, dtype=mx.float32).reshape(-1)
-            fk = self._crop(
-                inputs=[vf] + self.mx_dec,
-                output_shapes=[(N_tot * 2,)], output_dtypes=[mx.float32],
-                grid=gdims, threadgroup=self._tg_for(gdims[0]))[0]
-            del H, vf
-            outs.append(mx.view(fk, dtype=mx.complex64).reshape(*self.N))
+            mx.eval(fk)
+            outs.append(fk)
         res = mx.stack(outs)
         mx.eval(res)
         return np.array(res) if return_np else res
@@ -875,23 +911,39 @@ class Type2PlanND(_PointsND):
         if self._od:
             self._gather_od = self._build_od_gather(es)
 
-        # ---- pad mode box into FFT-order fine grid + deconvolve ----------
-        rnames = [f"r{d + 1}" for d in range(dim)]
-        src = self._grid_index_guard(rnames, nu)
-        src += (f"    size_t dst = "
-                f"{_linearize(rnames, nu)};\n")
-        for d in range(dim):
-            src += (f"    int q{d + 1} = (int)r{d + 1};  "
-                    f"q{d + 1} -= {nu[d]} * "
-                    f"(q{d + 1} >= {nu[d] - N[d] // 2});\n")
-        conds = " && ".join(
-            f"(q{d + 1} >= {-(N[d] // 2)} && q{d + 1} < {N[d] - N[d] // 2})"
-            for d in range(dim))
-        src += f"""    bool inband = {conds};
-    if (!inband) {{ H[2*dst] = 0.0f; H[2*dst+1] = 0.0f; return; }}
+        # ---- axis-0 pad + deconvolve (fused) -----------------------------
+        # _modes_to_grid FFTs axis 0 first, on a grid still cropped in every
+        # other axis: this kernel scatters the deconvolved modes into the
+        # axis-0 FFT-order rows (zeros out of band), with axis 0 cycled to
+        # the contiguous last position -> output (N[1], .., N[dim-1], nu[0]).
+        if dim == 3:
+            src = f"""
+    uint r1 = thread_position_in_grid.x;
+    uint m3 = thread_position_in_grid.y;
+    uint m2 = thread_position_in_grid.z;
+    if (r1 >= {nu[0]}u || m3 >= {N[2]}u) return;
 """
-        for d in range(dim):
-            src += f"    int m{d + 1} = q{d + 1} + {N[d] // 2};\n"
+        elif dim == 2:
+            src = f"""
+    uint r1 = thread_position_in_grid.x;
+    uint m2 = thread_position_in_grid.y;
+    if (r1 >= {nu[0]}u || m2 >= {N[1]}u) return;
+"""
+        else:
+            src = f"""
+    uint r1 = thread_position_in_grid.x;
+    if (r1 >= {nu[0]}u) return;
+"""
+        dnames = [f"m{d + 1}" for d in range(1, dim)] + ["r1"]
+        ddims = [N[d] for d in range(1, dim)] + [nu[0]]
+        src += f"    size_t dst = {_linearize(dnames, ddims)};\n"
+        src += (f"    int q1 = (int)r1;  "
+                f"q1 -= {nu[0]} * (q1 >= {nu[0] - N[0] // 2});\n")
+        src += (f"    bool inband = (q1 >= {-(N[0] // 2)} && "
+                f"q1 < {N[0] - N[0] // 2});\n")
+        src += """    if (!inband) { H[2*dst] = 0.0f; H[2*dst+1] = 0.0f; return; }
+"""
+        src += f"    int m1 = q1 + {N[0] // 2};\n"
         src += (f"    size_t src = "
                 f"{_linearize([f'm{d + 1}' for d in range(dim)], N)};\n")
         src += ("    float d = "
@@ -1072,23 +1124,55 @@ class Type2PlanND(_PointsND):
             output_names=["out"], header="#include <metal_math>\n" + es,
             source=src)
 
+    def _modes_to_grid(self, fkf):
+        """Progressive pad+FFT (mirror of Type1PlanND._fft_modes): flat
+        float32 view of the modeord box -> FFT'd fine grid (*n_up, natural
+        axis order, evaluated).
+
+        Each axis is zero-padded to nu_d immediately BEFORE its FFT, so
+        early FFTs run on the still-cropped box. The axis-0 pad and the
+        deconvolution ride one kernel (_pad); later pads are slice+
+        concatenate writes that also cycle the padded axis to the contiguous
+        last position, so every FFT is contiguous-last-axis."""
+        dim, N, nu = self.dim, self.N, self.n_up
+        inv = self.isign > 0
+        d0 = tuple(N[d] for d in range(1, dim)) + (nu[0],)
+        if dim == 3:
+            g = (nu[0], N[2], N[1])
+        elif dim == 2:
+            g = (nu[0], N[1], 1)
+        else:
+            g = (nu[0], 1, 1)
+        Hf = self._pad(
+            inputs=[fkf] + self.mx_dec,
+            output_shapes=[(int(np.prod(d0)) * 2,)],
+            output_dtypes=[mx.float32],
+            grid=g, threadgroup=self._tg_for(g[0]))[0]
+        H = mx.view(Hf, dtype=mx.complex64).reshape(*d0)
+        H = fft_axis(H, dim - 1, inverse=inv, twiddle_cache=self._twiddles)
+        cyc = tuple(range(1, dim)) + (0,)
+        for d in range(1, dim):
+            T = mx.transpose(H, cyc)          # axis d -> contiguous last
+            parts = [T[..., N[d] // 2:]]      # k = 0 .. N-N//2-1
+            if nu[d] > N[d]:
+                zshape = tuple(T.shape[:-1]) + (nu[d] - N[d],)
+                parts.append(mx.zeros(zshape, dtype=mx.complex64))
+            if N[d] // 2 > 0:
+                parts.append(T[..., :N[d] // 2])   # k = -N//2 .. -1
+            H = mx.concatenate(parts, axis=dim - 1)
+            H = fft_axis(H, dim - 1, inverse=inv,
+                         twiddle_cache=self._twiddles)
+        mx.eval(H)
+        return H
+
     def execute(self, fk, return_np=True):
-        nu_tot = int(np.prod(self.n_up))
         fmx = mx.array(np.ascontiguousarray(fk).astype(np.complex64)) \
             if not isinstance(fk, mx.array) else fk
         if fmx.size != int(np.prod(self.N)):
             raise ValueError(f"f.size ({fmx.size}) must equal the mode-box "
                              f"size {tuple(self.N)}")
         fkf = mx.view(fmx.reshape(-1), dtype=mx.float32)
-        gdims = tuple(reversed(self.n_up)) + (1,) * (3 - self.dim)
-        Hf = self._pad(
-            inputs=[fkf] + self.mx_dec,
-            output_shapes=[(nu_tot * 2,)],
-            output_dtypes=[mx.float32],
-            grid=gdims, threadgroup=self._tg_for(gdims[0]))[0]
-        mx.eval(Hf)
-        H = self._fft_grid(Hf)
-        del Hf
+        H = self._modes_to_grid(fkf)
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
         if self._od:
             # output written perm-indexed -> already in caller order
