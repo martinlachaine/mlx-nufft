@@ -566,13 +566,19 @@ class GpuT3Plan:
         es1 = _es_msl("k1", w, self.beta)
         es2 = _es_msl("k2", w2, self.beta2)
 
+        # cj is read in CALLER order via perm (sorted j -> caller jp) and the
+        # prephase multiply is fused here: saves two P-length passes
+        # (mx.take + complex mul) per execute.
         spread_src = f"""
     uint lane = thread_position_in_grid.x;   // 0..W*W-1
     uint j = thread_position_in_grid.y;      // point index (sorted order)
     if (lane >= {w * w}u || j >= {self.P}u) return;
     int lx = (int)(lane / {w}u), ly = (int)(lane % {w}u);
     float wxy = k1_es((float)lx - frx[j]) * k1_es((float)ly - fry[j]);
-    float cre = cj[2*j] * wxy, cim = cj[2*j+1] * wxy;
+    uint jp = perm[j];
+    float ar = cj[2*jp], ai = cj[2*jp+1];
+    float pr = pre[2*j], pi = pre[2*j+1];
+    float cre = (ar * pr - ai * pi) * wxy, cim = (ar * pi + ai * pr) * wxy;
     int ix = i1x[j] + lx;  ix -= {nf1} * (ix >= {nf1});  ix += {nf1} * (ix < 0);
     int iy = i1y[j] + ly;  iy -= {nf2} * (iy >= {nf2});  iy += {nf2} * (iy < 0);
     size_t base = ((size_t)ix * {nf2} + (size_t)iy) * {nf3};
@@ -589,7 +595,8 @@ class GpuT3Plan:
     }}
 """
         self._spread = mx.fast.metal_kernel(
-            name="t3spread", input_names=["cj", "i1x", "i1y", "i1z",
+            name="t3spread", input_names=["cj", "perm", "pre",
+                                          "i1x", "i1y", "i1z",
                                           "frx", "fry", "frz"],
             output_names=["grid"], header="#include <metal_math>\n" + es1,
             source=spread_src, atomic_outputs=True)
@@ -608,7 +615,10 @@ class GpuT3Plan:
     device atomic_float* g = (device atomic_float*) grid;
     int lx = (int)(lane / {w}u), ly = (int)(lane % {w}u);
     float wxy = k1_es((float)lx - frx[j]) * k1_es((float)ly - fry[j]);
-    float cre = cj[2*j] * wxy, cim = cj[2*j+1] * wxy;
+    uint jp = perm[j];
+    float ar = cj[2*jp], ai = cj[2*jp+1];
+    float pr = pre[2*j], pi = pre[2*j+1];
+    float cre = (ar * pr - ai * pi) * wxy, cim = (ar * pi + ai * pr) * wxy;
     int ix = i1x[j] + lx;  ix -= {nf1} * (ix >= {nf1});  ix += {nf1} * (ix < 0);
     int iy = i1y[j] + ly;  iy -= {nf2} * (iy >= {nf2});  iy += {nf2} * (iy < 0);
     size_t base = ((size_t)ix * {nf2} + (size_t)iy) * {nf3};
@@ -625,7 +635,8 @@ class GpuT3Plan:
     }}
 """
         self._spread_c = mx.fast.metal_kernel(
-            name="t3spread_c", input_names=["cj", "i1x", "i1y", "i1z",
+            name="t3spread_c", input_names=["cj", "perm", "pre",
+                                            "i1x", "i1y", "i1z",
                                             "frx", "fry", "frz"],
             output_names=["grid"], header="#include <metal_math>\n" + es1,
             source=spread_c_src, atomic_outputs=True)
@@ -811,10 +822,14 @@ class GpuT3Plan:
     if (lane >= {w * w}u || j >= {self.P}u) return;
     int lx = (int)(lane / {w}u), ly = (int)(lane % {w}u);
     float wxy = k1_es((float)lx - frx[j]) * k1_es((float)ly - fry[j]);
+    uint jp = perm[j];
+    float pr = pre[2*j], pi = pre[2*j+1];
     float cre[{nch}], cim[{nch}];
     for (int ch = 0; ch < {nch}; ++ch) {{
-        cre[ch] = cj[(j * {nch} + ch) * 2] * wxy;
-        cim[ch] = cj[(j * {nch} + ch) * 2 + 1] * wxy;
+        float ar = cj[(jp * {nch} + ch) * 2];
+        float ai = cj[(jp * {nch} + ch) * 2 + 1];
+        cre[ch] = (ar * pr - ai * pi) * wxy;
+        cim[ch] = (ar * pi + ai * pr) * wxy;
     }}
     int ix = i1x[j] + lx;  ix -= {nf1} * (ix >= {nf1});  ix += {nf1} * (ix < 0);
     int iy = i1y[j] + ly;  iy -= {nf2} * (iy >= {nf2});  iy += {nf2} * (iy < 0);
@@ -836,7 +851,8 @@ class GpuT3Plan:
 """
         spread = mx.fast.metal_kernel(
             name=f"t3spreadb{nch}",
-            input_names=["cj", "i1x", "i1y", "i1z", "frx", "fry", "frz"],
+            input_names=["cj", "perm", "pre",
+                         "i1x", "i1y", "i1z", "frx", "fry", "frz"],
             output_names=["grid"], header="#include <metal_math>\n" + es1,
             source=spread_src, atomic_outputs=True)
 
@@ -983,14 +999,16 @@ class GpuT3Plan:
             if self.low_mem:
                 mx.clear_cache()
 
-        C = mx.array(cs.astype(np.complex64))                  # (nch, P)
-        Cp = mx.take(C, self.mx_perm, axis=1) * self.mx_pre[None, :]
-        cpf = mx.view(mx.contiguous(mx.transpose(Cp, (1, 0))),
+        # caller-order (P,nch,2) layout; sort + prephase are fused in the
+        # spread kernel (perm-indexed cj reads, pre multiply)
+        C = mx.array(np.asarray(cs, dtype=np.complex64))       # (nch, P)
+        cpf = mx.view(mx.contiguous(mx.transpose(C, (1, 0))),
                       dtype=mx.float32).reshape(-1)            # (P,nch,2)
-        del C, Cp
+        del C
 
         bf = K["spread"](
-            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
+            inputs=[cpf, self.mx_perm, mx.view(self.mx_pre, dtype=mx.float32),
+                    self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
                     self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
             output_shapes=[(nf1 * nf2 * nf3 * nch * 2,)],
             output_dtypes=[mx.float32],
@@ -1051,16 +1069,17 @@ class GpuT3Plan:
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
 
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         assert cmx.size == self.P, \
             f"c.size ({cmx.size}) must equal number of sources ({self.P})"
-        cp = mx.take(cmx, self.mx_perm) * self.mx_pre
-        cpf = mx.view(cp, dtype=mx.float32)
+        # sort + prephase are fused into the spread kernel (perm/pre inputs)
+        cpf = mx.view(cmx, dtype=mx.float32)
         yield "prephase", cpf
 
         bf = self._spread(
-            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
+            inputs=[cpf, self.mx_perm, mx.view(self.mx_pre, dtype=mx.float32),
+                    self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
                     self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
             output_shapes=[(nf1 * nf2 * nf3 * 2,)],
             output_dtypes=[mx.float32],
@@ -1164,23 +1183,24 @@ class GpuT3Plan:
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
 
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         assert cmx.size == self.P, \
             f"c.size ({cmx.size}) must equal number of sources ({self.P})"
-        cp = mx.take(cmx, self.mx_perm) * self.mx_pre
-        cpf = mx.view(cp, dtype=mx.float32)
+        # sort + prephase are fused into the spread kernel (perm/pre inputs)
+        cpf = mx.view(cmx, dtype=mx.float32)
 
         # complex64-typed spread grid: nf1*nf2*nf3 elements (not 2x), so the
         # nf grid stays under the metal_kernel int32 cap to ~n_up 13.6k/axis.
         bf = self._spread_c(
-            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
+            inputs=[cpf, self.mx_perm, mx.view(self.mx_pre, dtype=mx.float32),
+                    self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
                     self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
             output_shapes=[(nf1 * nf2 * nf3,)],
             output_dtypes=[mx.complex64],
             grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
             init_value=0)[0]
-        del cp, cpf
+        del cpf
         mx.eval(bf)
         if self.low_mem:
             mx.clear_cache()
@@ -1292,6 +1312,15 @@ class GpuT3Plan:
         """Eager per-stage execution with explicit frees (peak-memory aware)."""
         if self.slab_mode:
             return self._execute_slab(c, return_np=return_np)
+        if not self.low_mem:
+            # ample-RAM machines: chain the whole graph, single eval at the
+            # end (per-stage eval only pays when clear_cache must bound the
+            # resident set; the graph frees intermediates as it runs)
+            res = None
+            for _label, res in self._stages(c):
+                pass
+            mx.eval(res)
+            return np.array(res) if return_np else res
         w = self.w
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
@@ -1299,21 +1328,22 @@ class GpuT3Plan:
             if self.low_mem:
                 mx.clear_cache()
 
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         assert cmx.size == self.P, \
             f"c.size ({cmx.size}) must equal number of sources ({self.P})"
-        cp = mx.take(cmx, self.mx_perm) * self.mx_pre
-        cpf = mx.view(cp, dtype=mx.float32)
+        # sort + prephase are fused into the spread kernel (perm/pre inputs)
+        cpf = mx.view(cmx, dtype=mx.float32)
 
         bf = self._spread(
-            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
+            inputs=[cpf, self.mx_perm, mx.view(self.mx_pre, dtype=mx.float32),
+                    self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
                     self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
             output_shapes=[(nf1 * nf2 * nf3 * 2,)],
             output_dtypes=[mx.float32],
             grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
             init_value=0)[0]
-        del cp, cpf
+        del cpf
         mx.eval(bf)
         _trim()
 

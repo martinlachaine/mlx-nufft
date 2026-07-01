@@ -582,7 +582,8 @@ class Type1PlanND(_PointsND):
         dim = self.dim
         nu_tot = int(np.prod(self.n_up))
         N_tot = int(np.prod(self.N))
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        # asarray(dtype=...) is a no-op for complex64 input (astype always copies)
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         if cmx.size != self.P:
             raise ValueError(f"c.size ({cmx.size}) must equal the number of "
@@ -609,8 +610,7 @@ class Type1PlanND(_PointsND):
                 grid=(lanes, max(self.P, 1), 1),
                 threadgroup=(lanes, max(1, 1024 // lanes), 1),
                 init_value=0)[0]
-        mx.eval(bf)
-        H = self._fft_grid(bf)
+        H = self._fft_grid(bf)          # chained: spread evals with the FFT
         del bf
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
         gdims = tuple(reversed(self.N)) + (1,) * (3 - dim)
@@ -758,7 +758,7 @@ class Type1PlanND(_PointsND):
         lanes = self._lanes
         gdims = tuple(reversed(self.N)) + (1,) * (3 - dim)
         Bchunk = max(1, (2**31 - 1) // (nu_tot * 2))     # grid output int32 cap
-        Cm = mx.array(np.ascontiguousarray(cs).astype(np.complex64))   # (Btot, P)
+        Cm = mx.array(np.asarray(cs, dtype=np.complex64))              # (Btot, P)
         Csort = mx.take(Cm, self.mx_perm, axis=1)        # plan (sort) order
         outs = []
         for b0 in range(0, Btot, Bchunk):
@@ -809,7 +809,7 @@ class Type1PlanND(_PointsND):
         groups = np.asarray(groups)
         if groups.shape != (self.P,):
             raise ValueError(f"groups must have shape ({self.P},)")
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         if cmx.size != self.P:
             raise ValueError(f"c.size ({cmx.size}) must equal the number of "
@@ -1074,7 +1074,7 @@ class Type2PlanND(_PointsND):
 
     def execute(self, fk, return_np=True):
         nu_tot = int(np.prod(self.n_up))
-        fmx = mx.array(np.ascontiguousarray(fk).astype(np.complex64)) \
+        fmx = mx.array(np.asarray(fk, dtype=np.complex64)) \
             if not isinstance(fk, mx.array) else fk
         if fmx.size != int(np.prod(self.N)):
             raise ValueError(f"f.size ({fmx.size}) must equal the mode-box "
@@ -1086,8 +1086,7 @@ class Type2PlanND(_PointsND):
             output_shapes=[(nu_tot * 2,)],
             output_dtypes=[mx.float32],
             grid=gdims, threadgroup=self._tg_for(gdims[0]))[0]
-        mx.eval(Hf)
-        H = self._fft_grid(Hf)
+        H = self._fft_grid(Hf)          # chained: pad evals with the FFT
         del Hf
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
         if self._od:

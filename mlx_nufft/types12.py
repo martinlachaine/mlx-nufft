@@ -153,7 +153,7 @@ class Type1Plan(_Points12):
         w = self.w
         nu1, nu2, nu3 = self.n_up
         N1, N2, N3 = self.N
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         cpf = mx.view(mx.take(cmx, self.mx_perm), dtype=mx.float32)
         bf = self._spread(
@@ -258,7 +258,7 @@ class Type2Plan(_Points12):
     def execute(self, fk, return_np=True):
         nu1, nu2, nu3 = self.n_up
         N1, N2, N3 = self.N
-        fmx = mx.array(np.ascontiguousarray(fk).astype(np.complex64)) \
+        fmx = mx.array(np.asarray(fk, dtype=np.complex64)) \
             if not isinstance(fk, mx.array) else fk
         fkf = mx.view(fmx.reshape(-1), dtype=mx.float32)
         Hf = self._pad(
