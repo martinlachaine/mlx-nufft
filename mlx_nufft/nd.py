@@ -94,9 +94,16 @@ def _build_t1_df64_setup_kernel(dim):
 class _PointsND:
     """Shared point/kernel setup for ND types 1 and 2."""
 
-    def __init__(self, x, n_modes, eps, isign, upsampfac, prec, sort_points):
+    def __init__(self, x, n_modes, eps, isign, upsampfac, prec, sort_points,
+                 fft_backend="mlx"):
         if prec not in ("fp32", "crit64"):
             raise ValueError("prec must be 'fp32' or 'crit64'")
+        if fft_backend not in ("mlx", "vkfft"):
+            raise ValueError("fft_backend must be 'mlx' or 'vkfft'")
+        if fft_backend == "vkfft":
+            from . import vkfft_backend as _vk
+            _vk.require()          # fail fast with a clear message if not built
+        self.fft_backend = fft_backend
         if isinstance(x, np.ndarray) and x.ndim == 1:
             x = (x,)
         x = tuple(x)
@@ -123,6 +130,12 @@ class _PointsND:
         w = self.w
         self.n_up = [next235even(max(2 * w, int(np.ceil(upsampfac * n))))
                      for n in self.N]
+        # whole-grid in-place FFT via VkFFT when every axis is a
+        # radix-supported length (next235even sizes always are); otherwise
+        # this plan's FFTs keep the validated mlx fft_axis path.
+        self._vkfft_fftn = (
+            fft_backend == "vkfft"
+            and all(_vk.supported_length(n) for n in self.n_up))
 
         x64 = [np.asarray(v, dtype=np.float64).ravel() for v in x]
         self.P = x64[0].size
@@ -358,6 +371,14 @@ class _PointsND:
 
     def _fft_grid(self, Hf):
         H = mx.view(Hf, dtype=mx.complex64).reshape(*self.n_up)
+        if self._vkfft_fftn:
+            # whole-grid in-place (i)FFT, natural order. VkFFT's inverse
+            # normalization (1/N_total) equals mlx's per-axis 1/n, so the
+            # isign>0 scale folded into decs[0] is shared with the mlx path.
+            from . import vkfft_backend as _vk
+            inv = self.isign > 0
+            mx.eval(H)
+            return _vk.fftn_inplace(H, 1 if inv else -1, 1 if inv else 0)
         for ax in range(self.dim - 1, -1, -1):
             Hn = fft_axis(H, ax, inverse=self.isign > 0,
                           twiddle_cache=self._twiddles)
@@ -369,11 +390,17 @@ class _PointsND:
 
 
 class Type1PlanND(_PointsND):
-    """f[k] = sum_j c[j] exp(i*isign * k . x_j), modeord=0 box, dims 1-3."""
+    """f[k] = sum_j c[j] exp(i*isign * k . x_j), modeord=0 box, dims 1-3.
+
+    fft_backend: "mlx" (default, validated) or "vkfft" (optional VkFFT-Metal
+    bridge; whole-grid in-place FFT — see mlx_nufft/vkfft_backend.py).
+    """
 
     def __init__(self, x, n_modes, eps=1e-6, isign=+1, upsampfac=2.0,
-                 prec="crit64", sort_points=True, spread_method="auto"):
-        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points)
+                 prec="crit64", sort_points=True, spread_method="auto",
+                 fft_backend="mlx"):
+        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points,
+                         fft_backend=fft_backend)
         dim, w, P = self.dim, self.w, self.P
         nu = self.n_up
         N = self.N
@@ -953,11 +980,17 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
 
 
 class Type2PlanND(_PointsND):
-    """c[j] = sum_k f[k] exp(i*isign * k . x_j), modeord=0 box, dims 1-3."""
+    """c[j] = sum_k f[k] exp(i*isign * k . x_j), modeord=0 box, dims 1-3.
+
+    fft_backend: "mlx" (default, validated) or "vkfft" (optional VkFFT-Metal
+    bridge; whole-grid in-place FFT — see mlx_nufft/vkfft_backend.py).
+    """
 
     def __init__(self, x, n_modes, eps=1e-6, isign=-1, upsampfac=2.0,
-                 prec="crit64", sort_points=False, spread_method="auto"):
-        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points)
+                 prec="crit64", sort_points=False, spread_method="auto",
+                 fft_backend="mlx"):
+        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points,
+                         fft_backend=fft_backend)
         dim, w, P = self.dim, self.w, self.P
         nu = self.n_up
         N = self.N

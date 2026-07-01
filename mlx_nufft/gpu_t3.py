@@ -414,7 +414,10 @@ class GpuT3Plan:
         bridge dylib, see mlx_nufft/vkfft_backend.py). The vkfft path emits
         the lateral FFT in natural order, so its gather uses an identity
         scramble; it covers the slab full-padz path (grid < 2**31 elements,
-        n_up ≲ 9000/axis at nu3=24)."""
+        n_up ≲ 9000/axis at nu3=24) AND the non-slab 3D FFT (one in-place
+        whole-grid call when every n_up axis is a radix-2,3,5,7,11,13 length
+        — always true for next235even sizes; else that FFT keeps the mlx
+        path)."""
         assert prec in ("fp32", "coords64", "phases64", "crit64")
         assert fft_backend in ("mlx", "vkfft")
         if fft_backend == "vkfft":
@@ -546,6 +549,13 @@ class GpuT3Plan:
             # gather must not de-scramble: force identity on both axes.
             self.scramA = (1, self.n_up[0])
             self.scramB = (1, self.n_up[1])
+        # non-slab: the whole 3D FFT goes to VkFFT in one in-place call when
+        # every axis is a radix-supported length (next235even sizes always
+        # are); the non-slab gather reads natural order, matching VkFFT's
+        # output, so no scramble handling is involved.
+        self._vkfft_fft3 = (
+            self.fft_backend == "vkfft"
+            and all(_vk.supported_length(n) for n in self.n_up))
         # mlx's memory limit is soft; in low_mem mode return freed buffers
         # to the OS after each stage so the pool stays ~2 live grids
         if low_mem is None:
@@ -1514,6 +1524,15 @@ class GpuT3Plan:
             return np.array(res)
         return res
 
+    def _fft3_vkfft(self, H):
+        """Whole-grid in-place 3D (i)FFT via the VkFFT bridge (natural order).
+        VkFFT's inverse normalization (1/N_total) equals MLX's per-axis 1/n,
+        so the deconvolution scale in decs[0] is shared with the mlx path."""
+        from . import vkfft_backend as _vk
+        inv = self.isign > 0
+        mx.eval(H)
+        return _vk.fftn_inplace(H, 1 if inv else -1, 1 if inv else 0)
+
     # ------------------------------------------------------------------
     def _stages(self, c):
         """Lazy mx graph for one transform; yields (label, array) stages."""
@@ -1540,10 +1559,13 @@ class GpuT3Plan:
         yield "pad+deconv", Hf
 
         H = mx.view(Hf, dtype=mx.complex64).reshape(nu1, nu2, nu3)
-        # axis-by-axis keeps peak memory at ~2x the inner grid
-        for ax in (2, 1, 0):
-            H = fft_axis(H, ax, inverse=self.isign > 0,
-                         twiddle_cache=self._twiddles)
+        if self._vkfft_fft3:
+            H = self._fft3_vkfft(H)
+        else:
+            # axis-by-axis keeps peak memory at ~2x the inner grid
+            for ax in (2, 1, 0):
+                H = fft_axis(H, ax, inverse=self.isign > 0,
+                             twiddle_cache=self._twiddles)
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
         yield "fft", vf
 
@@ -1935,14 +1957,17 @@ class GpuT3Plan:
         _trim()
 
         H = mx.view(H, dtype=mx.complex64).reshape(nu1, nu2, nu3)
-        for ax in (2, 1, 0):
-            Hn = fft_axis(H, ax, inverse=self.isign > 0,
-                          twiddle_cache=self._twiddles)
-            del H
-            H = Hn
-            del Hn
-            mx.eval(H)
-            _trim()
+        if self._vkfft_fft3:
+            H = self._fft3_vkfft(H)
+        else:
+            for ax in (2, 1, 0):
+                Hn = fft_axis(H, ax, inverse=self.isign > 0,
+                              twiddle_cache=self._twiddles)
+                del H
+                H = Hn
+                del Hn
+                mx.eval(H)
+                _trim()
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
 
         out = self._gather_stage(vf)

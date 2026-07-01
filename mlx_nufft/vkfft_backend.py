@@ -1,4 +1,4 @@
-"""Optional VkFFT-Metal FFT backend for the type-3 slab pipeline.
+"""Optional VkFFT-Metal FFT backend (type-3 slab + full 1D/2D/3D grids).
 
 Zero-copy bridge: an MLX array's data lives in 16 KB-aligned unified memory; we
 hand its pointer (via dlpack) to a small C-ABI dylib that wraps it as an
@@ -11,11 +11,13 @@ Opt-in: requires building `vkfft_bridge/libvkfft_bridge.dylib`
 validated default backend; `fft_backend="vkfft"` raises a clear error if the
 bridge is not built.
 
-Conventions (validated vs mx.fft): the bridge does a batched 2D complex64 FFT
-over the leading (batch) axis of a C-contiguous (nb, n_outer, n_contig) array.
-`size[0]` is the contiguous axis, so we pass (n_contig, n_outer, nb). For the
-MLX inverse-FFT convention (isign>0) use inverse=1, normalize=1; for the
-forward convention (isign<0) use inverse=-1, normalize=0.
+Conventions (validated vs mx.fft/np.fft): `fft2_inplace` does a batched 2D
+complex64 FFT over the leading (batch) axis of a C-contiguous
+(nb, n_outer, n_contig) array; `fftn_inplace` a whole-array 1D/2D/3D FFT.
+`size[0]` is the contiguous axis, so shapes are passed reversed. For the MLX
+inverse-FFT convention (isign>0) use inverse=1, normalize=1 (VkFFT's inverse
+normalization is 1/N_total, identical to MLX's per-axis 1/n); for the forward
+convention (isign<0) use inverse=-1, normalize=0.
 """
 
 import ctypes
@@ -48,6 +50,11 @@ def _load():
                 lib.vkfft_fft2_inplace.argtypes = [
                     ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
                     ctypes.c_uint64, ctypes.c_int, ctypes.c_int]
+                lib.vkfft_fftn_inplace.restype = ctypes.c_int
+                lib.vkfft_fftn_inplace.argtypes = [
+                    ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+                    ctypes.c_uint64, ctypes.c_uint64, ctypes.c_int,
+                    ctypes.c_int, ctypes.c_int]
                 _lib = lib
                 return
             except Exception as e:                       # pragma: no cover
@@ -92,3 +99,41 @@ def fft2_inplace(arr, inverse, normalize):
     if rc != 0:
         raise RuntimeError(f"vkfft_fft2_inplace failed (rc={rc})")
     return arr
+
+
+def fftn_inplace(arr, inverse, normalize):
+    """In-place whole-array FFT of an MLX complex64 array of ndim 1..3 (no
+    batch axis; every axis is transformed). `arr` must be evaluated (mx.eval)
+    first; it is mutated in place and also returned. inverse/normalize: see
+    module docstring.
+    """
+    require()
+    import mlx.core as mx
+    assert isinstance(arr, mx.array) and arr.dtype == mx.complex64
+    dim = arr.ndim
+    assert 1 <= dim <= 3, "expect ndim in 1..3"
+    sizes = [int(s) for s in reversed(arr.shape)] + [1] * (3 - dim)
+    cap = arr.__dlpack__()                 # MUST stay alive across the call
+    ptr = ctypes.cast(_GET(cap, b"dltensor"),
+                      ctypes.POINTER(ctypes.c_void_p))[0]
+    rc = _lib.vkfft_fftn_inplace(ctypes.c_void_p(ptr), sizes[0], sizes[1],
+                                 sizes[2], 1, dim,
+                                 int(inverse), int(normalize))
+    del cap
+    if rc != 0:
+        raise RuntimeError(f"vkfft_fftn_inplace failed (rc={rc})")
+    return arr
+
+
+# VkFFT-Metal covers radix 2,3,5,7,11,13 lengths directly. Grid sizes from
+# next235even are always 2,3,5-smooth so in practice nothing falls back, but
+# the plans gate on this before routing an FFT to the bridge (unsupported
+# lengths keep the validated MLX path).
+def supported_length(n):
+    n = int(n)
+    if n < 1:
+        return False
+    for p in (2, 3, 5, 7, 11, 13):
+        while n % p == 0:
+            n //= p
+    return n == 1
