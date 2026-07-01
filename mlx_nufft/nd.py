@@ -489,60 +489,116 @@ class Type1PlanND(_PointsND):
             output_names=["grid"], header="#include <metal_math>\n" + self._es,
             source=src, atomic_outputs=True)
 
+    # points per batch in the OD spread inner loop; staging costs
+    # B*(dim*w + dim + 2) threadgroup words on top of the 2*ptot-word tile
+    _OD_SPREAD_B = {1: 32, 2: 32, 3: 16}
+
+    # threadgroup float add: bit-cast CAS on atomic_uint (Metal has no
+    # threadgroup-scope atomic_float); contention is low — concurrent
+    # lanes mostly hold distinct taps
+    _TG_FADD = """#include <metal_math>
+inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
+    uint prev = atomic_load_explicit(a, metal::memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(
+        a, &prev, as_type<uint>(as_type<float>(prev) + v),
+        metal::memory_order_relaxed, metal::memory_order_relaxed)) {}
+}
+"""
+
     def _build_od_spread(self, es):
         """Output-driven spread: one threadgroup per subproblem, padded tile
-        in threadgroup memory, tap-parallel accumulation (no atomics inside
-        the tile), one global atomic add per tile cell at flush."""
+        in threadgroup memory. Points are processed in batches of B: lanes
+        0..bn stage their point's strength (perm-gather) + tile cell offsets,
+        all lanes cooperatively stage the per-dim 1D ES weights (layout
+        wts[b][d][l]); after one barrier a flat loop over the batch's tap
+        tasks accumulates into the tile with bit-cast CAS float adds
+        (tg_fadd) — two barriers per batch instead of one per point, and all
+        lanes stay busy. In dims 1-2 a task is one (point, tap); in 3D a
+        task is (point, ax, ay) and the z taps ride a register loop over
+        contiguous tile cells (one decode + xy-weight load per w adds).
+        Flush: one global atomic add per tile cell, periodic wrap."""
         dim, w = self.dim, self.w
         nu = self.n_up
         m, p, ptot = self._od_m, self._od_p, self._od_ptot
         TG = self._OD_TG
         taps = w ** dim
+        B = self._OD_SPREAD_B[dim]
+        dw = dim * w
         src = f"""
     uint tid = thread_position_in_threadgroup.x;
     uint sub = threadgroup_position_in_grid.y;
-    threadgroup float tile[{2 * ptot}];
-    for (uint q = tid; q < {2 * ptot}u; q += {TG}u) tile[q] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup atomic_uint tile[{2 * ptot}];
+    threadgroup float wts[{B * dw}];
+    threadgroup float str[{2 * B}];
+    threadgroup int loff[{B * dim}];
+    for (uint q = tid; q < {2 * ptot}u; q += {TG}u)
+        atomic_store_explicit(&tile[q], 0u, memory_order_relaxed);
     uint s0 = (uint)sub_start[sub];
     uint cnt = (uint)sub_count[sub];
 """
         for d in range(dim):
             src += f"    int o{_AX[d]} = sub_o{_AX[d]}[sub];\n"
-        src += """    for (uint t = 0; t < cnt; ++t) {
-        uint j = s0 + t;
-        uint jp = perm[j];
-        float cre = cj[2*jp], cim = cj[2*jp+1];
+        src += f"""    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t0 = 0; t0 < cnt; t0 += {B}u) {{
+        uint bn = metal::min({B}u, cnt - t0);
+        uint base = s0 + t0;
+        if (tid < bn) {{
+            uint jp = perm[base + tid];
+            str[2*tid]   = cj[2*jp];
+            str[2*tid+1] = cj[2*jp+1];
 """
         for d in range(dim):
-            a = _AX[d]
-            src += (f"        int l0{a} = i1{a}[j] - o{a};  "
-                    f"float f{a} = fr{a}[j];\n")
-        src += f"""        for (uint tap = tid; tap < {taps}u; tap += {TG}u) {{
+            src += (f"            loff[{dim}u*tid + {d}u] = "
+                    f"i1{_AX[d]}[base + tid] - o{_AX[d]};\n")
+        src += "        }\n"
+        for d in range(dim):
+            src += f"""        for (uint q = tid; q < bn * {w}u; q += {TG}u) {{
+            uint b = q / {w}u, l = q % {w}u;
+            wts[b * {dw}u + {d * w}u + l] =
+                k1_es((float)l - fr{_AX[d]}[base + b]);
+        }}
 """
+        src += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
         if dim == 1:
-            src += """            int ax = (int)tap;
-            float wgt = k1_es((float)ax - fx);
-            uint cell = (uint)(l0x + ax);
+            src += f"""        for (uint q = tid; q < bn * {taps}u; q += {TG}u) {{
+            uint b = q / {taps}u;
+            uint ax = q % {taps}u;
+            float wgt = wts[b * {dw}u + ax];
+            uint cell = (uint)(loff[b] + (int)ax);
+            tg_fadd(&tile[2*cell],   str[2*b]   * wgt);
+            tg_fadd(&tile[2*cell+1], str[2*b+1] * wgt);
+        }}
 """
         elif dim == 2:
-            src += f"""            int ax = (int)(tap / {w}u), ay = (int)(tap % {w}u);
-            float wgt = k1_es((float)ax - fx) * k1_es((float)ay - fy);
-            uint cell = (uint)(l0x + ax) * {p[1]}u + (uint)(l0y + ay);
+            src += f"""        for (uint q = tid; q < bn * {taps}u; q += {TG}u) {{
+            uint b = q / {taps}u;
+            uint tap = q % {taps}u;
+            uint ax = tap / {w}u, ay = tap % {w}u;
+            float wgt = wts[b * {dw}u + ax] * wts[b * {dw}u + {w}u + ay];
+            uint cell = (uint)(loff[2u*b] + (int)ax) * {p[1]}u
+                      + (uint)(loff[2u*b+1u] + (int)ay);
+            tg_fadd(&tile[2*cell],   str[2*b]   * wgt);
+            tg_fadd(&tile[2*cell+1], str[2*b+1] * wgt);
+        }}
 """
         else:
-            src += f"""            int ax = (int)(tap / {w * w}u);
-            uint rem = tap % {w * w}u;
-            int ay = (int)(rem / {w}u), az = (int)(rem % {w}u);
-            float wgt = k1_es((float)ax - fx) * k1_es((float)ay - fy)
-                      * k1_es((float)az - fz);
-            uint cell = ((uint)(l0x + ax) * {p[1]}u + (uint)(l0y + ay))
-                      * {p[2]}u + (uint)(l0z + az);
+            src += f"""        for (uint q = tid; q < bn * {w * w}u; q += {TG}u) {{
+            uint b = q / {w * w}u;
+            uint rem = q % {w * w}u;
+            uint ax = rem / {w}u, ay = rem % {w}u;
+            float wxy = wts[b * {dw}u + ax] * wts[b * {dw}u + {w}u + ay];
+            float cre = str[2*b] * wxy, cim = str[2*b+1] * wxy;
+            uint cell0 = ((uint)(loff[3u*b] + (int)ax) * {p[1]}u
+                        + (uint)(loff[3u*b+1u] + (int)ay)) * {p[2]}u
+                       + (uint)loff[3u*b+2u];
+            for (uint az = 0; az < {w}u; ++az) {{
+                float wz = wts[b * {dw}u + {2 * w}u + az];
+                tg_fadd(&tile[2*(cell0 + az)],   cre * wz);
+                tg_fadd(&tile[2*(cell0 + az)+1], cim * wz);
+            }}
+        }}
 """
-        src += """            tile[2*cell]   += cre * wgt;
-            tile[2*cell+1] += cim * wgt;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        src += """        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 """
         # flush padded tile to the global fine grid with periodic wrap
@@ -550,7 +606,8 @@ class Type1PlanND(_PointsND):
         if dim == 1:
             src += "        int px = (int)q;\n"
         elif dim == 2:
-            src += f"        int px = (int)(q / {p[1]}u), py = (int)(q % {p[1]}u);\n"
+            src += (f"        int px = (int)(q / {p[1]}u), "
+                    f"py = (int)(q % {p[1]}u);\n")
         else:
             src += (f"        int px = (int)(q / {p[1] * p[2]}u);\n"
                     f"        uint qr = q % {p[1] * p[2]}u;\n"
@@ -563,10 +620,14 @@ class Type1PlanND(_PointsND):
                     f"g{a} += {nu[d]} * (g{a} < 0);\n")
         gexpr = _linearize([f"g{_AX[d]}" for d in range(dim)], nu)
         src += f"""        size_t cell = {gexpr};
-        atomic_fetch_add_explicit(&grid[2*cell],   tile[2*q],
-                                  memory_order_relaxed);
-        atomic_fetch_add_explicit(&grid[2*cell+1], tile[2*q+1],
-                                  memory_order_relaxed);
+        atomic_fetch_add_explicit(&grid[2*cell],
+            as_type<float>(atomic_load_explicit(&tile[2*q],
+                                                memory_order_relaxed)),
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(&grid[2*cell+1],
+            as_type<float>(atomic_load_explicit(&tile[2*q+1],
+                                                memory_order_relaxed)),
+            memory_order_relaxed);
     }}
 """
         innames = (["cj", "perm"] + [f"i1{_AX[d]}" for d in range(dim)]
@@ -575,7 +636,7 @@ class Type1PlanND(_PointsND):
                    + [f"sub_o{_AX[d]}" for d in range(dim)])
         return mx.fast.metal_kernel(
             name=f"t1spread{dim}d_od", input_names=innames,
-            output_names=["grid"], header="#include <metal_math>\n" + es,
+            output_names=["grid"], header=self._TG_FADD + es,
             source=src, atomic_outputs=True)
 
     def execute(self, c, return_np=True):
