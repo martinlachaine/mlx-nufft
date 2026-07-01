@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+Performance release: 1.4–2.8x faster whole-transform execution across types
+and dimensions on Apple silicon (measured on M5 Max, 128 GB; default MLX
+backend, identical accuracy gates). No API changes; numerical results agree
+with the previous release within the documented fp32 atomic-ordering noise.
+
+- ES spreading kernel evaluated via `metal::fast::exp2`/`fast::sqrt`
+  (end-to-end rel-L2 1.70e-6 vs 1.55e-6 at eps=1e-6 — below the fp32
+  pipeline floor).
+- Type-1 output-driven spread reworked cuFINUFFT-style: points processed in
+  batches with cooperatively staged per-point 1D kernel weights and a flat
+  tap loop (two threadgroup barriers per batch instead of one per point;
+  all 256 lanes busy). 2D M=1e7 spread 14.3 -> 5.0 ms.
+- Type-3 non-slab point kernels ported to the same output-driven machinery
+  (w=9 tiles), with a zero-skip tile flush; targets are cell-sorted at plan
+  time and gathered perm-indexed with the postphase folded in
+  (spread 40 -> 14 ms, gather 38 -> 5 ms at P=M=1e6).
+- Progressive FFT: type 1 crops each axis to its mode band immediately after
+  that axis's FFT (type 2 pads the mirror way), with axis cycling keeping
+  every FFT contiguous-last-axis — FFT work drops to
+  (1 + 1/sigma + 1/sigma^2)/3 in 3D (t1 fft+crop 27.5 -> 10.9 ms at 512^3).
+- Type-3 slab pipeline batched: fused twiddle+transpose Metal kernel in the
+  lateral four-step, and one full-z gather launch instead of nu3 accumulating
+  launches (anisotropic whole-execute 320 -> 264 ms; with VkFFT 178 -> 160).
+- Sort + prephase fused into the type-3 spread kernels; execute-path input
+  conversions no longer copy complex64 arrays. Peak execute memory is
+  unchanged (type 3) or lower (types 1/2: progressive crop trims the
+  intermediates, 6.3 -> 4.0 GiB on the 3D M=1e7 case).
+- Optional VkFFT backend extended with a whole-array 1D/2D/3D in-place FFT:
+  `fft_backend="vkfft"` now also covers the non-slab type-3 inner-grid FFT
+  (640^3: 54 -> 36 ms; whole t3 generic P=1e6 94 -> 78 ms). Still opt-in;
+  MLX remains the validated default.
+
 ## v0.1.3 — 2026-06-28
 
 Infrastructure only — no library or numerical behavior changes. First release

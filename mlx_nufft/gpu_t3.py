@@ -1953,18 +1953,15 @@ class GpuT3Plan:
         return res
 
     def execute(self, c, return_np=True):
-        """Eager per-stage execution with explicit frees (peak-memory aware)."""
+        """Eager per-stage execution with explicit frees (peak-memory aware).
+
+        Chaining the whole graph into one eval was measured ~4 ms faster on
+        this pipeline but holds every intermediate live (peak 5.9 -> 14.6 GiB
+        on the 640^3 generic case) — a 16 GB machine sits below the low_mem
+        auto threshold there and would swap, so the per-stage eval stays
+        unconditional."""
         if self.slab_mode:
             return self._execute_slab(c, return_np=return_np)
-        if not self.low_mem:
-            # ample-RAM machines: chain the whole graph, single eval at the
-            # end (per-stage eval only pays when clear_cache must bound the
-            # resident set; the graph frees intermediates as it runs)
-            res = None
-            for _label, res in self._stages(c):
-                pass
-            mx.eval(res)
-            return np.array(res) if return_np else res
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
         def _trim():
