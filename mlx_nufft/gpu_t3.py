@@ -288,6 +288,103 @@ def _inner_kernel_params(eps, sigma_inner):
     return ns, beta
 
 
+# ---- output-driven (OD) tiling: port of nd.py's cuFINUFFT-style
+#      subproblem machinery to the type-3 SPREAD (non-slab path). Points are
+#      bin-sorted; one 256-thread threadgroup processes one subproblem
+#      against a padded tile of the nf grid staged in threadgroup memory
+#      (32 KB on Apple GPUs).
+#      The gather side does NOT tile: at type-3 target densities (~1 target
+#      per bin) a staged tile loads ~5x more grid data than the targets
+#      read, and measured 5x slower than simply running the naive per-target
+#      kernel over cell-SORTED targets (L1/L2 then dedup the overlapping
+#      w2^3 neighbourhoods across neighbouring threads).
+_OD_TG = 256
+_OD_MSUB = 1024            # spread subproblem cap (load balance)
+_OD_MIN_PTS = 20000        # below this the naive kernels win (nd.py rule)
+_OD_BIN_SHIFT = 64         # bin-id bias keeping GPU int division nonnegative
+
+
+def _od_tile_dims_t3(w, grid):
+    """3D bin sizes m_d = 15 - w with padded tile p_d = m_d + w (nd.py's 3D
+    sizing with its w <= 8 guard relaxed: the t3 kernel at eps=1e-5,
+    sigma=1.25 has w=9, giving m=6^3, tile 15^3 = 27 KB, which fits the
+    28 KB threadgroup budget). None when the tile cannot fit."""
+    m = [15 - w] * 3
+    p = [mi + w for mi in m]
+    ptot = int(np.prod(p))
+    if any(mi < 1 for mi in m) or ptot * 8 > 28 * 1024 \
+            or any(n < pi for n, pi in zip(grid, p)):
+        return None
+    return m, p, ptot
+
+
+def _od_bins_host(i1, w2, m):
+    """Per-dim bin ids b_d = floor((i1_d + w2)/m_d) (host fp path), biased
+    by their min so keys are nonnegative even for the slightly-negative i1
+    the set_sources guard band admits. Returns (key, nb, borig) with
+    borig[d] the true bin id of shifted bin 0."""
+    b, borig, nb = [], [], []
+    for d in range(3):
+        bd = (i1[d].astype(np.int64) + w2) // m[d]
+        lo = int(bd.min())
+        b.append(bd - lo)
+        borig.append(lo)
+        nb.append(int(b[d].max()) + 1)
+    key = (b[0] * nb[1] + b[1]) * nb[2] + b[2]
+    return key, nb, borig
+
+
+def _od_bins_gpu(i1_g, w2, m):
+    """GPU analogue of _od_bins_host on mx int32 arrays. mx integer division
+    truncates toward zero, so the numerator is pre-shifted by _OD_BIN_SHIFT
+    bins to stay nonnegative (floor == trunc there); the shift is folded
+    back into borig. All six min/max scalars come back in ONE sync."""
+    bs = [(i1_g[d] + (w2 + _OD_BIN_SHIFT * m[d])) // m[d] for d in range(3)]
+    ext = [mx.min(bs[0]), mx.max(bs[0]), mx.min(bs[1]), mx.max(bs[1]),
+           mx.min(bs[2]), mx.max(bs[2])]
+    mx.eval(*ext)
+    b, borig, nb = [], [], []
+    for d in range(3):
+        lo, hi = int(np.array(ext[2 * d])), int(np.array(ext[2 * d + 1]))
+        b.append(bs[d] - lo)
+        borig.append(lo - _OD_BIN_SHIFT)
+        nb.append(hi - lo + 1)
+    key = (b[0] * nb[1] + b[1]) * nb[2] + b[2]
+    return key, nb, borig
+
+
+def _od_subprob_tables(key_s, msub, nb, m, w2, borig):
+    """Subproblem tables from the SORTED (shifted) bin-key array, vectorized
+    over bins — the same construction as nd.py's _od_finish. Returns
+    (nsub, sub_start, sub_count, origins[3]) with origins the tile origin
+    Delta_d = b_d*m_d - w2 per subproblem."""
+    starts = np.flatnonzero(np.r_[True, key_s[1:] != key_s[:-1]])
+    counts = np.diff(np.r_[starts, key_s.size])
+    nsub_per_bin = (counts + msub - 1) // msub
+    total = int(nsub_per_bin.sum())
+    bin_id = np.repeat(np.arange(starts.size), nsub_per_bin)
+    seg_beg = np.cumsum(nsub_per_bin) - nsub_per_bin
+    off = (np.arange(total) - np.repeat(seg_beg, nsub_per_bin)) * msub
+    sub_start = (starts[bin_id] + off).astype(np.int32)
+    sub_count = np.minimum(msub, counts[bin_id] - off).astype(np.int32)
+    sub_key = key_s[starts][bin_id].astype(np.int64)
+    origins, rem = [], sub_key
+    for d in (2, 1, 0):
+        bd = rem % nb[d]
+        rem = rem // nb[d]
+        origins.insert(0, ((bd + borig[d]) * m[d] - w2).astype(np.int32))
+    return total, sub_start, sub_count, origins
+
+
+def _od_pack(total, sub_start, sub_count, origins, m, p, ptot):
+    """Upload subproblem tables; the dict is the runtime OD state."""
+    tabs = dict(nsub=total, m=m, p=p, ptot=ptot,
+                start=mx.array(sub_start), count=mx.array(sub_count),
+                o=[mx.array(v) for v in origins])
+    mx.eval(tabs["start"], tabs["count"], *tabs["o"])
+    return tabs
+
+
 class GpuT3Plan:
     def __init__(self, x, s, eps=1e-5, isign=+1, upsampfac=1.25,
                  prec="crit64", sigma_inner=None, sort_points=True,
@@ -442,7 +539,38 @@ class GpuT3Plan:
         self.low_mem = bool(low_mem)
         self._kernels_P = None
         self._df64_setup = None
+        self._ods = None            # source-side OD tables (set_sources)
+        self._prepare_od_targets()  # target-side cell sort (frozen)
         self.set_sources(x)   # source-side state (+ kernel build)
+
+    # ------------------------------------------------------------------
+    def _prepare_od_targets(self):
+        """Sort targets by inner-fine-grid cell at plan time (lexicographic
+        cell key; measured slightly better gather locality than 3D-bin
+        blocks). mx_ti1/mx_tfr/mx_post stay in CALLER order — the slab/batch
+        kernels keep using them; the sorted gather reads the mx_g* mirrors
+        and writes out[2*jp] perm-indexed, so caller order is free."""
+        self._tgt_sorted = False
+        if self.slab_mode or self.M < _OD_MIN_PTS:
+            return
+        nu1, nu2, nu3 = self.n_up
+        key = ((self.t_i1[0].astype(np.int64) * nu2 + self.t_i1[1]) * nu3
+               + self.t_i1[2])
+        gperm = np.argsort(key, kind="stable")
+        self.mx_gperm = mx.array(gperm.astype(np.uint32))
+        self.mx_gi1 = [mx.array(v[gperm]) for v in self.t_i1]
+        self.mx_gfr = [mx.array(v[gperm]) for v in self.t_fr]
+        mx.eval(self.mx_gperm, *self.mx_gi1, *self.mx_gfr)
+        self._tgt_sorted = True
+
+    def _od_source_dims(self):
+        """Tile dims for the source-side OD spread, or None when the naive
+        kernel should be used (small P, unsorted plans, w < 5 where the
+        direct atomic spread is equally fast, slab path, tile misfit)."""
+        if self.slab_mode or not self._sort_points \
+                or self.P < _OD_MIN_PTS or self.w < 5:
+            return None
+        return _od_tile_dims_t3(self.w, self.nf)
 
     # ------------------------------------------------------------------
     def set_sources(self, x, backend="host"):
@@ -490,12 +618,23 @@ class GpuT3Plan:
             xp = [v.astype(pdt) for v in x64]
             pre_ang = sum(pdt(self.D[d]) * xp[d] for d in range(3))
             prephase = np.exp(1j * self.isign * pre_ang.astype(np.float64))
-            if self._sort_points:
+            dims = self._od_source_dims()
+            if dims is not None:
+                # OD spread: bin-key sort replaces the lateral sort
+                m, p, ptot = dims
+                w2o = self.w // 2
+                key, nb, borig = _od_bins_host(i1, w2o, m)
+                perm = np.argsort(key, kind="stable")
+                self._ods = _od_pack(*_od_subprob_tables(
+                    key[perm], _OD_MSUB, nb, m, w2o, borig), m, p, ptot)
+            elif self._sort_points:
                 perm = np.argsort(
                     i1[0].astype(np.int64) * self.nf[1] + i1[1],
                     kind="stable")
+                self._ods = None
             else:
                 perm = np.arange(P)
+                self._ods = None
             self.perm = perm
             self.i1 = [v[perm] for v in i1]
             self.fr = [v[perm] for v in fr]
@@ -545,11 +684,25 @@ class GpuT3Plan:
             grid=(P, 1, 1), threadgroup=(256, 1, 1))
         i10, i11, i12, fr0, fr1, fr2, pref = outs
         pre = mx.view(pref.reshape(P, 2), dtype=mx.complex64).reshape(P)
-        if self._sort_points:
+        dims = self._od_source_dims()
+        if dims is not None:
+            # OD bin-sort on the GPU; the subproblem-table build stays host-
+            # side (over bins, not points) from ONE P-length pull of the
+            # sorted keys — the sole device->host sync (as nd.py does).
+            m, p, ptot = dims
+            w2o = self.w // 2
+            key_g, nb, borig = _od_bins_gpu((i10, i11, i12), w2o, m)
+            perm = mx.argsort(key_g)
+            key_s = np.array(mx.take(key_g, perm))
+            self._ods = _od_pack(*_od_subprob_tables(
+                key_s, _OD_MSUB, nb, m, w2o, borig), m, p, ptot)
+        elif self._sort_points:
             key = i10 * self.nf[1] + i11
             perm = mx.argsort(key)
+            self._ods = None
         else:
             perm = mx.arange(P, dtype=mx.uint32)
+            self._ods = None
         self.mx_perm = perm.astype(mx.uint32)
         self.mx_i1 = [mx.take(v, perm) for v in (i10, i11, i12)]
         self.mx_fr = [mx.take(v, perm) for v in (fr0, fr1, fr2)]
@@ -696,6 +849,15 @@ class GpuT3Plan:
             output_names=["out"], header="#include <metal_math>\n" + es2,
             source=gather_src)
 
+        # ---- OD spread + sorted gather (non-slab path) --------------------
+        self._spread_od = None
+        self._gather_srt = None
+        sdims = _od_tile_dims_t3(w, self.nf)
+        if not self.slab_mode and sdims is not None:
+            self._spread_od = self._build_od_spread(es1, sdims)
+        if self._tgt_sorted:
+            self._gather_srt = self._build_sorted_gather(es2)
+
         # ---- slab-mode kernels -------------------------------------------
         # pad + mode-deconvolve + brute z-DFT, writing z-major Z[l3, r1, r2]
         padz_src = f"""
@@ -790,6 +952,169 @@ class GpuT3Plan:
                          "tfrx", "tfry", "tfrz"],
             output_names=["accout"], header="#include <metal_math>\n" + es2,
             source=gslab_src)
+
+    # ------------------------------------------------------------------
+    def _build_od_spread(self, es, dims):
+        """Output-driven spread into the nf grid (port of nd.py's
+        _build_od_spread, 3D): one threadgroup per subproblem, padded tile
+        in threadgroup memory, per-point 1D weights staged once, then
+        tap-parallel accumulation (distinct taps of one point hit distinct
+        tile cells, so no atomics inside the tile; two barriers per point),
+        and one global atomic add per NONZERO tile cell at flush — at
+        type-3 densities (~2 points per bin) most cells stay zero, so the
+        zero-skip drops most of the flush traffic. cj is read in sorted
+        order (the prephase take already applied perm)."""
+        w = self.w
+        nf1, nf2, nf3 = self.nf
+        m, p, ptot = dims
+        TG = _OD_TG
+        src = f"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint sub = threadgroup_position_in_grid.y;
+    threadgroup float tile[{2 * ptot}];
+    threadgroup float twt[{3 * w}];
+    for (uint q = tid; q < {2 * ptot}u; q += {TG}u) tile[q] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint s0 = (uint)sub_start[sub];
+    uint cnt = (uint)sub_count[sub];
+    int ox = sub_ox[sub], oy = sub_oy[sub], oz = sub_oz[sub];
+    for (uint t = 0; t < cnt; ++t) {{
+        uint j = s0 + t;
+        float cre = cj[2*j], cim = cj[2*j+1];
+        int l0x = i1x[j] - ox;
+        int l0y = i1y[j] - oy;
+        int l0z = i1z[j] - oz;
+        // per-point 1D weights staged once (3w ES evals vs 3 per tap)
+        if (tid < {3 * w}u) {{
+            int d = (int)(tid / {w}u), l = (int)(tid % {w}u);
+            float f = d == 0 ? frx[j] : (d == 1 ? fry[j] : frz[j]);
+            twt[tid] = k1_es((float)l - f);
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint tap = tid; tap < {w ** 3}u; tap += {TG}u) {{
+            int ax = (int)(tap / {w * w}u);
+            uint rem = tap % {w * w}u;
+            int ay = (int)(rem / {w}u), az = (int)(rem % {w}u);
+            float wgt = twt[ax] * twt[{w} + ay] * twt[{2 * w} + az];
+            uint cell = ((uint)(l0x + ax) * {p[1]}u + (uint)(l0y + ay))
+                      * {p[2]}u + (uint)(l0z + az);
+            tile[2*cell]   += cre * wgt;
+            tile[2*cell+1] += cim * wgt;
+        }}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }}
+    for (uint q = tid; q < {ptot}u; q += {TG}u) {{
+        float tre = tile[2*q], tim = tile[2*q+1];
+        if (tre == 0.0f && tim == 0.0f) continue;
+        int px = (int)(q / {p[1] * p[2]}u);
+        uint qr = q % {p[1] * p[2]}u;
+        int py = (int)(qr / {p[2]}u), pz = (int)(qr % {p[2]}u);
+        int gx = ox + px;  gx -= {nf1} * (gx >= {nf1});  gx += {nf1} * (gx < 0);
+        int gy = oy + py;  gy -= {nf2} * (gy >= {nf2});  gy += {nf2} * (gy < 0);
+        int gz = oz + pz;  gz -= {nf3} * (gz >= {nf3});  gz += {nf3} * (gz < 0);
+        size_t cell = ((size_t)gx * {nf2} + (size_t)gy) * {nf3} + (size_t)gz;
+        atomic_fetch_add_explicit(&grid[2*cell],   tre, memory_order_relaxed);
+        atomic_fetch_add_explicit(&grid[2*cell+1], tim, memory_order_relaxed);
+    }}
+"""
+        return mx.fast.metal_kernel(
+            name="t3spread_od",
+            input_names=["cj", "i1x", "i1y", "i1z", "frx", "fry", "frz",
+                         "sub_start", "sub_count",
+                         "sub_ox", "sub_oy", "sub_oz"],
+            output_names=["grid"], header="#include <metal_math>\n" + es,
+            source=src, atomic_outputs=True)
+
+    def _build_sorted_gather(self, es):
+        """Cell-sorted gather: the naive per-target kernel run over the
+        cell-SORTED target arrays with the result written perm-indexed
+        (out[2*jp], caller order free) — neighbouring threads then interp
+        overlapping w2^3 neighbourhoods of the inner grid, so L1/L2 dedup
+        most of the scattered reads. Measured well ahead of a threadgroup-
+        tiled OD gather at type-3 target densities (~1 target per tile).
+        The final postphase multiply is folded in; post[] is indexed by the
+        ORIGINAL target index jp."""
+        w2 = self.w2
+        nu1, nu2, nu3 = self.n_up
+        src = f"""
+    uint kk = thread_position_in_grid.x;
+    if (kk >= {self.M}u) return;
+    uint jp = gperm[kk];
+    float wx[{w2}], wy[{w2}], wz[{w2}];
+    int jx[{w2}], jy[{w2}], jz[{w2}];
+    float fx = tfrx[kk], fy = tfry[kk], fz = tfrz[kk];
+    int x0 = ti1x[kk], y0 = ti1y[kk], z0 = ti1z[kk];
+    for (int l = 0; l < {w2}; ++l) {{
+        wx[l] = k2_es((float)l - fx);
+        wy[l] = k2_es((float)l - fy);
+        wz[l] = k2_es((float)l - fz);
+        int a = x0 + l; a -= {nu1} * (a >= {nu1}); a += {nu1} * (a < 0); jx[l] = a;
+        int b = y0 + l; b -= {nu2} * (b >= {nu2}); b += {nu2} * (b < 0); jy[l] = b;
+        int c = z0 + l; c -= {nu3} * (c >= {nu3}); c += {nu3} * (c < 0); jz[l] = c;
+    }}
+    float accre = 0.0f, accim = 0.0f;
+    for (int lx = 0; lx < {w2}; ++lx) {{
+        for (int ly = 0; ly < {w2}; ++ly) {{
+            float wxy = wx[lx] * wy[ly];
+            size_t base = ((size_t)jx[lx] * {nu2} + (size_t)jy[ly]) * {nu3};
+            float sre = 0.0f, sim = 0.0f;
+            for (int lz = 0; lz < {w2}; ++lz) {{
+                float wv = wz[lz];
+                size_t idx = base + (size_t)jz[lz];
+                sre = metal::fma(v[2*idx], wv, sre);
+                sim = metal::fma(v[2*idx+1], wv, sim);
+            }}
+            accre = metal::fma(sre, wxy, accre);
+            accim = metal::fma(sim, wxy, accim);
+        }}
+    }}
+    float pre_ = post[2*jp], pim_ = post[2*jp+1];
+    out[2*jp]   = accre * pre_ - accim * pim_;
+    out[2*jp+1] = accre * pim_ + accim * pre_;
+"""
+        return mx.fast.metal_kernel(
+            name="t3gather_srt",
+            input_names=["v", "gperm", "ti1x", "ti1y", "ti1z",
+                         "tfrx", "tfry", "tfrz", "post"],
+            output_names=["out"], header="#include <metal_math>\n" + es,
+            source=src)
+
+    # ---- stage dispatch: OD spread / sorted gather when applicable ------
+    def _spread_stage(self, cpf):
+        nf1, nf2, nf3 = self.nf
+        if self._ods is not None:
+            od = self._ods
+            return self._spread_od(
+                inputs=[cpf] + self.mx_i1 + self.mx_fr
+                       + [od["start"], od["count"]] + od["o"],
+                output_shapes=[(nf1 * nf2 * nf3 * 2,)],
+                output_dtypes=[mx.float32],
+                grid=(_OD_TG, od["nsub"], 1), threadgroup=(_OD_TG, 1, 1),
+                init_value=0)[0]
+        w = self.w
+        return self._spread(
+            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
+                    self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
+            output_shapes=[(nf1 * nf2 * nf3 * 2,)],
+            output_dtypes=[mx.float32],
+            grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
+            init_value=0)[0]
+
+    def _gather_stage(self, vf):
+        if self._tgt_sorted:
+            return self._gather_srt(
+                inputs=[vf, self.mx_gperm] + self.mx_gi1 + self.mx_gfr
+                       + [self.mx_post.reshape(-1)],
+                output_shapes=[(self.M * 2,)],
+                output_dtypes=[mx.float32],
+                grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
+        return self._gather(
+            inputs=[vf, self.mx_ti1[0], self.mx_ti1[1], self.mx_ti1[2],
+                    self.mx_tfr[0], self.mx_tfr[1], self.mx_tfr[2],
+                    self.mx_post.reshape(-1)],
+            output_shapes=[(self.M * 2,)],
+            output_dtypes=[mx.float32],
+            grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
 
     # ------------------------------------------------------------------
     def _build_batch_kernels(self, nch):
@@ -1047,7 +1372,6 @@ class GpuT3Plan:
     # ------------------------------------------------------------------
     def _stages(self, c):
         """Lazy mx graph for one transform; yields (label, array) stages."""
-        w = self.w
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
 
@@ -1059,13 +1383,7 @@ class GpuT3Plan:
         cpf = mx.view(cp, dtype=mx.float32)
         yield "prephase", cpf
 
-        bf = self._spread(
-            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
-                    self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
-            output_shapes=[(nf1 * nf2 * nf3 * 2,)],
-            output_dtypes=[mx.float32],
-            grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
-            init_value=0)[0]
+        bf = self._spread_stage(cpf)
         yield "spread", bf
 
         Hf = self._pad(
@@ -1084,13 +1402,7 @@ class GpuT3Plan:
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
         yield "fft", vf
 
-        out = self._gather(
-            inputs=[vf, self.mx_ti1[0], self.mx_ti1[1], self.mx_ti1[2],
-                    self.mx_tfr[0], self.mx_tfr[1], self.mx_tfr[2],
-                    self.mx_post.reshape(-1)],
-            output_shapes=[(self.M * 2,)],
-            output_dtypes=[mx.float32],
-            grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
+        out = self._gather_stage(vf)
         res = mx.view(out, dtype=mx.complex64)
         yield "gather", res
 
@@ -1292,7 +1604,6 @@ class GpuT3Plan:
         """Eager per-stage execution with explicit frees (peak-memory aware)."""
         if self.slab_mode:
             return self._execute_slab(c, return_np=return_np)
-        w = self.w
         nf1, nf2, nf3 = self.nf
         nu1, nu2, nu3 = self.n_up
         def _trim():
@@ -1306,13 +1617,7 @@ class GpuT3Plan:
         cp = mx.take(cmx, self.mx_perm) * self.mx_pre
         cpf = mx.view(cp, dtype=mx.float32)
 
-        bf = self._spread(
-            inputs=[cpf, self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
-                    self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
-            output_shapes=[(nf1 * nf2 * nf3 * 2,)],
-            output_dtypes=[mx.float32],
-            grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
-            init_value=0)[0]
+        bf = self._spread_stage(cpf)
         del cp, cpf
         mx.eval(bf)
         _trim()
@@ -1338,13 +1643,7 @@ class GpuT3Plan:
             _trim()
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
 
-        out = self._gather(
-            inputs=[vf, self.mx_ti1[0], self.mx_ti1[1], self.mx_ti1[2],
-                    self.mx_tfr[0], self.mx_tfr[1], self.mx_tfr[2],
-                    self.mx_post.reshape(-1)],
-            output_shapes=[(self.M * 2,)],
-            output_dtypes=[mx.float32],
-            grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
+        out = self._gather_stage(vf)
         del H, vf
         res = mx.view(out, dtype=mx.complex64)
         mx.eval(res)
