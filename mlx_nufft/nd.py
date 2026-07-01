@@ -703,7 +703,8 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
 
     def execute(self, c, return_np=True):
         nu_tot = int(np.prod(self.n_up))
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        # asarray(dtype=...) is a no-op for complex64 input (astype copies)
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         if cmx.size != self.P:
             raise ValueError(f"c.size ({cmx.size}) must equal the number of "
@@ -730,8 +731,7 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
                 grid=(lanes, max(self.P, 1), 1),
                 threadgroup=(lanes, max(1, 1024 // lanes), 1),
                 init_value=0)[0]
-        mx.eval(bf)
-        res = self._fft_modes(
+        res = self._fft_modes(          # chained: spread evals with the FFT
             mx.view(bf, dtype=mx.complex64).reshape(*self.n_up))
         del bf
         mx.eval(res)
@@ -868,7 +868,7 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
         nu_tot = int(np.prod(self.n_up))
         lanes = self._lanes
         Bchunk = max(1, (2**31 - 1) // (nu_tot * 2))     # grid output int32 cap
-        Cm = mx.array(np.ascontiguousarray(cs).astype(np.complex64))   # (Btot, P)
+        Cm = mx.array(np.asarray(cs, dtype=np.complex64))              # (Btot, P)
         Csort = mx.take(Cm, self.mx_perm, axis=1)        # plan (sort) order
         outs = []
         for b0 in range(0, Btot, Bchunk):
@@ -911,7 +911,7 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
         groups = np.asarray(groups)
         if groups.shape != (self.P,):
             raise ValueError(f"groups must have shape ({self.P},)")
-        cmx = mx.array(np.asarray(c).astype(np.complex64)) \
+        cmx = mx.array(np.asarray(c, dtype=np.complex64)) \
             if not isinstance(c, mx.array) else c
         if cmx.size != self.P:
             raise ValueError(f"c.size ({cmx.size}) must equal the number of "
@@ -1227,7 +1227,9 @@ class Type2PlanND(_PointsND):
         return H
 
     def execute(self, fk, return_np=True):
-        fmx = mx.array(np.ascontiguousarray(fk).astype(np.complex64)) \
+        # asarray(dtype=...) is a no-op for complex64 input (astype copies);
+        # mx.array materializes a contiguous buffer either way
+        fmx = mx.array(np.asarray(fk, dtype=np.complex64)) \
             if not isinstance(fk, mx.array) else fk
         if fmx.size != int(np.prod(self.N)):
             raise ValueError(f"f.size ({fmx.size}) must equal the mode-box "
