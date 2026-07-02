@@ -3,10 +3,13 @@
 ## Unreleased
 
 Performance release: 1.4–2.8x faster whole-transform execution across types
-and dimensions on Apple silicon (measured on M5 Max, 128 GB; default MLX
-backend, identical accuracy gates). No breaking API changes (additive kwargs
-only); numerical results agree with the previous release within the
-documented fp32 atomic-ordering noise.
+and dimensions, and 30–100x faster plan construction (t1 3D M=1e7 plan
+5.5 s -> 0.05 s; t3 N=1024 M=P=1e6 plan 2.0 s -> 0.06 s; one-shot `nufft3d3`
+2.2 s -> 0.26 s), on Apple silicon (measured on M5 Max, 128 GB; default MLX
+backend, identical accuracy gates — the full acceptance matrix and adjoint
+checks pass unchanged). No breaking API changes (additive kwargs only);
+numerical results agree with the previous release within the documented fp32
+atomic-ordering noise.
 
 - ES spreading kernel evaluated via `metal::fast::exp2`/`fast::sqrt`
   (end-to-end rel-L2 1.70e-6 vs 1.55e-6 at eps=1e-6 — below the fp32
