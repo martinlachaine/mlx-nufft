@@ -413,12 +413,28 @@ class Type1PlanND(_PointsND):
         assert spread_method in ("auto", "od", "gm")
         # OD pays when the tap count keeps a 256-thread group busy (w >= 5);
         # at w <= 4 the direct atomic spread is equally fast and simpler.
+        # Preference order: exclusive-ownership OD (no global atomics, no
+        # output zero-init) -> padded-tile OD -> GM.
         want_od = (spread_method == "od"
                    or (spread_method == "auto" and w >= 5))
-        self._od = self._finish_points_od(want_od, self._OD_MSUB)
-        if spread_method == "od" and not self._od:
+        modx = self._odx_dims() if (want_od and dim == 1) else None
+        self._od_ex = False
+        if modx is not None:
+            if self._pending_gpu is not None:
+                # try exclusive on the pending GPU cells; on failure keep
+                # them pending for _finish_points_od's padded-OD/lateral path
+                self._od_ex = self._odx_prepare_gpu(modx, *self._pending_gpu)
+                if self._od_ex:
+                    self._pending_gpu = None
+            else:
+                self._od_ex = self._odx_prepare(modx)
+        self._od = ((not self._od_ex)
+                    and self._finish_points_od(want_od, self._OD_MSUB))
+        if spread_method == "od" and not (self._od or self._od_ex):
             raise ValueError("OD spreading not applicable to this geometry")
-        if self._od:
+        if self._od_ex:
+            self._spread_ex = self._build_od_spread_ex(es)
+        elif self._od:
             self._spread_od = self._build_od_spread(es)
 
         # ---- spread: lane covers (lx[,ly]) taps; dim 3 loops lz ----------
@@ -427,7 +443,8 @@ class Type1PlanND(_PointsND):
         # GM spread is the sliceable path (its baked P is an upper guard, so it
         # runs over any point-subset launched with fewer grid rows) -> reused by
         # execute_disjoint. Built eagerly only when it is the chosen spreader.
-        self._spread = None if self._od else self._build_gm_spread()
+        self._spread = None if (self._od or self._od_ex) \
+            else self._build_gm_spread()
 
         # in-band FFT-order rows per axis, in modeord order (negative block
         # first): gather indices for the progressive crop (axes 1..dim-1;
@@ -689,6 +706,358 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
             output_names=["grid"], header=self._TG_FADD + es,
             source=src, atomic_outputs=True)
 
+    # -- exclusive-ownership OD spread (gather formulation) ---------------
+    #
+    # One threadgroup OWNS one m^d region of the fine grid outright (no
+    # guard padding): it is the only writer of those cells, so the flush is
+    # plain coalesced stores — no global atomics and no output zero-init
+    # (the region boxes tile the grid exactly; top-edge remainder regions
+    # clip their extent). Candidate points live in the region's own bin
+    # plus the 3^d-1 neighbouring bins (bin size m >= w//2 keeps every
+    # support within one bin of its region, wrap included); each candidate
+    # is clip-tested against the region box and simd-compacted before the
+    # tap pipeline.
+    #
+    # Auto-selected for dim 1 ONLY, where it measures ~2x faster than the
+    # padded-tile kernel (M5 Max, M=1e7, nu=2e6: 4.0 -> 2.0 ms). In dim 2 it
+    # ties (11.5 vs 11.2 ms at M=1e7, nu=4096^2) and in dim 3 it loses
+    # (75 -> 132 ms at M=1e7, nu=512^3): each point is scanned from 3^d
+    # neighbour bins and staged in ~(1+(w-1)/m)^d regions, and the smaller
+    # unpadded tile roughly doubles the threadgroup-CAS retry cost — in 3D
+    # those overheads exceed the padded kernel's whole flush+init budget
+    # (~10 ms measured). The kernel builder stays dim-general for retuning.
+
+    _ODX_TG = 256
+    # candidate windows in flight per simdgroup (overlaps the per-candidate
+    # device-load latency); >1 costs registers — a loss for dims 2-3
+    _ODX_ILP = {1: 4, 2: 1, 3: 1}
+    _ODX_M = {1: 512, 2: 28, 3: 12}
+    _ODX_MAXBIN = 65536              # clustering guard: 1 threadgroup/region
+
+    def _odx_dims(self):
+        """Region sizes m_d for the exclusive spread, or None if the
+        geometry does not admit it (padded-tile OD is the fallback). Per
+        dim: >= 3 regions (the neighbour scan needs distinct bins) and a
+        top remainder region absent or >= w//2 wide (wrapped support from
+        bin 0 must not reach below the last region); tile + compaction
+        staging within the 32 KB threadgroup budget."""
+        w2 = self.w // 2
+        m = []
+        for d in range(self.dim):
+            nu, m0 = self.n_up[d], self._ODX_M[self.dim]
+            md = next((mc for mc in range(m0, max(w2, m0 - 8) - 1, -1)
+                       if nu >= 3 * mc
+                       and (nu % mc == 0 or nu % mc >= w2)),
+                      None)
+            if md is None:
+                return None
+            m.append(md)
+        tg_bytes = (2 * int(np.prod(m)) * 4
+                    + self._ODX_TG * (2 * self.dim + 2) * 4
+                    + (2 * 3 ** self.dim + 1) * 4 + 16)
+        return m if tg_bytes <= 32 * 1024 else None
+
+    def _odx_fold(self, i1, nu, w2):
+        """Fold i1 so the support CENTRE cell i1 + w2 lies in [0, nu) — the
+        bin the point resides in. Only even w at the top grid edge can push
+        the centre to nu; shifting i1 by -nu is a no-op for the periodic
+        tap arithmetic (same cells, same offsets)."""
+        return i1 - (nu * ((i1 + w2) >= nu)).astype(i1.dtype)
+
+    def _odx_prepare(self, m):
+        """Host bin-sort onto the exclusive region grid + region CSR;
+        mirrors _od_prepare."""
+        if self.P < 20000:
+            return False
+        w2 = self.w // 2
+        nb = [-(-self.n_up[d] // m[d]) for d in range(self.dim)]
+        i1f = [self._odx_fold(self.i1[d].astype(np.int64), self.n_up[d], w2)
+               for d in range(self.dim)]
+        key = (i1f[0] + w2) // m[0]
+        for d in range(1, self.dim):
+            key = key * nb[d] + (i1f[d] + w2) // m[d]
+        perm = np.argsort(key, kind="stable")
+        if not self._odx_finish(key[perm], nb, m):
+            return False
+        self.perm = perm
+        self.mx_perm = mx.array(perm.astype(np.uint32))
+        self.mx_i1 = [mx.array(v[perm].astype(np.int32)) for v in i1f]
+        self.mx_fr = [mx.array(v[perm]) for v in self.fr]
+        return True
+
+    def _odx_prepare_gpu(self, m, i1_g, fr_g):
+        """GPU bin-sort for the exclusive spread; the CSR build stays host-
+        side from ONE P-length pull of the sorted keys (cf. _od_prepare_gpu)."""
+        if self.P < 20000:
+            return False
+        w2 = self.w // 2
+        nb = [-(-self.n_up[d] // m[d]) for d in range(self.dim)]
+        i1f = [i1_g[d] - self.n_up[d] * ((i1_g[d] + w2) >= self.n_up[d])
+               for d in range(self.dim)]
+        key_g = (i1f[0] + w2) // m[0]
+        for d in range(1, self.dim):
+            key_g = key_g * nb[d] + (i1f[d] + w2) // m[d]
+        perm_g = mx.argsort(key_g).astype(mx.uint32)
+        key_s = np.array(mx.take(key_g, perm_g))       # one P-length sync
+        if not self._odx_finish(key_s, nb, m):
+            return False
+        self.mx_perm = perm_g
+        self.mx_i1 = [mx.take(v, perm_g) for v in i1f]
+        self.mx_fr = [mx.take(v, perm_g) for v in fr_g]
+        mx.eval(self.mx_perm, *self.mx_i1, *self.mx_fr)
+        self.perm = np.array(self.mx_perm).astype(np.intp)
+        return True
+
+    def _odx_finish(self, key_s, nb, m):
+        """Region CSR (bin_start, over ALL regions incl. empty — every grid
+        cell must be written by exactly one region) from the sorted bin
+        keys. False under extreme clustering: a region cannot be split
+        across threadgroups without losing the exclusive plain flush."""
+        nreg = int(np.prod(nb))
+        starts = np.searchsorted(key_s, np.arange(nreg + 1)).astype(np.int32)
+        if int(np.diff(starts).max(initial=0)) > self._ODX_MAXBIN:
+            return False
+        self.sorted = True
+        self._odx_m, self._odx_nb, self._odx_nreg = m, nb, nreg
+        self._mx_bin_start = mx.array(starts)
+        return True
+
+    def _build_od_spread_ex(self, es):
+        """Exclusive-ownership spread kernel, simdgroup-autonomous: at ~28 KB
+        of threadgroup memory only one threadgroup is resident per core, so
+        threadgroup barriers stall the whole core — the pipeline therefore
+        runs per SIMDGROUP (lockstep, simdgroup_barrier only) with no
+        threadgroup barrier between the initial range-table build and the
+        final flush. A shared work counter deals 32-candidate windows of the
+        3^d neighbour-bin ranges to simdgroups; each lane maps its virtual
+        index to (range, point) via the prefixed range table, clip-tests the
+        point's tap window against the owned box (wrap bins carry a +-nu
+        cell-offset adjustment), simd-compacts the survivors into the
+        simdgroup's staging slots, and the simdgroup spreads them with
+        on-the-fly ES weights (fast exp2) and tg_fadd CAS adds into the
+        UNPADDED m^d tile. Flush: plain stores to the owned cells."""
+        dim, w = self.dim, self.w
+        nu = self.n_up
+        m, nb = self._odx_m, self._odx_nb
+        TG, ilp = self._ODX_TG, self._ODX_ILP[self.dim]
+        nr = 3 ** dim
+        mtot = int(np.prod(m))
+        src = f"""
+    uint tid = thread_position_in_threadgroup.x;
+    uint rid = threadgroup_position_in_grid.y;
+    uint lane = tid & 31u;
+    threadgroup atomic_uint tile[{2 * mtot}];
+"""
+        for d in range(dim):
+            a = _AX[d]
+            src += (f"    threadgroup int so{a}[{TG}];  "
+                    f"threadgroup float sf{a}[{TG}];\n")
+        src += f"""    threadgroup float ssr[{TG}], ssi[{TG}];
+    threadgroup uint bst[{nr}], cum[{nr + 1}];
+    threadgroup atomic_uint wk;
+"""
+        if dim == 3:
+            src += f"""    uint rx = rid / {nb[1] * nb[2]}u;
+    uint rr = rid % {nb[1] * nb[2]}u;
+    uint ry = rr / {nb[2]}u, rz = rr % {nb[2]}u;
+"""
+        elif dim == 2:
+            src += f"    uint rx = rid / {nb[1]}u, ry = rid % {nb[1]}u;\n"
+        else:
+            src += "    uint rx = rid;\n"
+        for d in range(dim):
+            a = _AX[d]
+            src += (f"    int g0{a} = (int)r{a} * {m[d]};  "
+                    f"int ms{a} = metal::min({m[d]}, {nu[d]} - g0{a});\n")
+        src += f"""    for (uint q = tid; q < {2 * mtot}u; q += {TG}u)
+        atomic_store_explicit(&tile[q], 0u, memory_order_relaxed);
+    if (tid == 0u) atomic_store_explicit(&wk, 0u, memory_order_relaxed);
+    if (tid < {nr}u) {{
+"""
+        # neighbour-bin decode for range r = tid (fastest axis fastest)
+        div = 1
+        for d in range(dim - 1, -1, -1):
+            a = _AX[d]
+            src += (f"        int b{a} = (int)r{a} + (int)(tid / {div}u) "
+                    f"% 3 - 1;\n"
+                    f"        b{a} += {nb[d]} * (b{a} < 0);  "
+                    f"b{a} -= {nb[d]} * (b{a} >= {nb[d]});\n")
+            div *= 3
+        bexpr = f"(uint)b{_AX[0]}"
+        for d in range(1, dim):
+            bexpr = f"({bexpr} * {nb[d]}u + (uint)b{_AX[d]})"
+        src += f"""        uint bi = {bexpr};
+        bst[tid] = (uint)bin_start[bi];
+        cum[tid] = (uint)bin_start[bi + 1u] - bst[tid];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {{
+        uint acc = 0u;
+        for (uint r = 0u; r < {nr}u; ++r)
+            {{ uint cc = cum[r]; cum[r] = acc; acc += cc; }}
+        cum[{nr}] = acc;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint total = cum[{nr}];
+    uint v0 = 0u;
+    if (metal::simd_is_first())
+        v0 = atomic_fetch_add_explicit(&wk, {32 * ilp}u, memory_order_relaxed);
+    v0 = metal::simd_broadcast_first(v0);
+    while (v0 < total) {{
+        // {ilp} windows in flight: the per-candidate device loads (i1) are
+        // issued together so their latency overlaps instead of chaining
+        bool keep[{ilp}];
+        uint j[{ilp}];
+"""
+        src += ("        int "
+                + ", ".join(f"o{_AX[d]}[{ilp}]" for d in range(dim)) + ";\n")
+        src += f"""        for (uint u = 0u; u < {ilp}u; ++u) {{
+            keep[u] = false;
+            uint v = v0 + u * 32u + lane;
+            if (v < total) {{
+                uint r = 0u;
+"""
+        step = 1
+        while step * 2 <= nr - 1:
+            step *= 2
+        while step:
+            src += (f"                if (r + {step}u <= {nr - 1}u && "
+                    f"cum[r + {step}u] <= v) r += {step}u;\n")
+            step //= 2
+        src += "                j[u] = bst[r] + (v - cum[r]);\n"
+        div = 1
+        for d in range(dim - 1, -1, -1):
+            a = _AX[d]
+            src += (f"                int b{a} = (int)r{a} + "
+                    f"(int)(r / {div}u) % 3 - 1;\n"
+                    f"                int adj{a} = (b{a} < 0) ? -{nu[d]} : "
+                    f"((b{a} >= {nb[d]}) ? {nu[d]} : 0);\n"
+                    f"                o{a}[u] = i1{a}[j[u]] + adj{a} - g0{a};\n")
+            div *= 3
+        src += ("                keep[u] = "
+                + "\n                    && ".join(
+                    f"(metal::max(0, -o{_AX[d]}[u]) < "
+                    f"metal::min({w}, ms{_AX[d]} - o{_AX[d]}[u]))"
+                    for d in range(dim))
+                + ";\n            }\n        }\n")
+        src += """        for (uint u = 0u; u < {ILP}u; ++u) {
+        uint flag = keep[u] ? 1u : 0u;
+        uint pos = metal::simd_prefix_exclusive_sum(flag);
+        uint nk = metal::simd_sum(flag);
+        if (nk == 0u) continue;
+        if (keep[u]) {
+            uint s = (tid & ~31u) + pos;
+""".replace("{ILP}", str(ilp))
+        for d in range(dim):
+            a = _AX[d]
+            src += (f"            so{a}[s] = o{a}[u];  "
+                    f"sf{a}[s] = fr{a}[j[u]];\n")
+        src += f"""            uint jp = perm[j[u]];
+            ssr[s] = cj[2u*jp];  ssi[s] = cj[2u*jp+1u];
+        }}
+        metal::simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint t = lane; t < nk * {w}u; t += 32u) {{
+            uint b = (tid & ~31u) + t / {w}u;
+            int ax = (int)(t % {w}u);
+            int ux = so{_AX[0]}[b] + ax;
+            if (ux >= 0 && ux < ms{_AX[0]}) {{
+                float wx = k1_es((float)ax - sf{_AX[0]}[b]);
+"""
+        if dim == 1:
+            src += """                tg_fadd(&tile[2u*(uint)ux],    ssr[b] * wx);
+                tg_fadd(&tile[2u*(uint)ux+1u], ssi[b] * wx);
+"""
+        elif dim == 2:
+            src += f"""                float cre = ssr[b] * wx, cim = ssi[b] * wx;
+                int oy2 = soy[b];  float fy = sfy[b];
+                uint rowb = (uint)ux * {m[1]}u;
+                for (int ly = 0; ly < {w}; ++ly) {{
+                    int uy = oy2 + ly;
+                    if (uy < 0 || uy >= msy) continue;
+                    float wy = k1_es((float)ly - fy);
+                    uint cell = rowb + (uint)uy;
+                    tg_fadd(&tile[2u*cell],    cre * wy);
+                    tg_fadd(&tile[2u*cell+1u], cim * wy);
+                }}
+"""
+        else:
+            src += f"""                float cre = ssr[b] * wx, cim = ssi[b] * wx;
+                int oy2 = soy[b], oz2 = soz[b];
+                float fy = sfy[b], fz = sfz[b];
+                int ly0 = metal::max(0, -oy2);
+                int ly1 = metal::min({w}, msy - oy2);
+                uint rowb = (uint)ux * {m[1]}u;
+                for (int ly = ly0; ly < ly1; ++ly) {{
+                    float wy = k1_es((float)ly - fy);
+                    float yre = cre * wy, yim = cim * wy;
+                    uint rowc = (rowb + (uint)(oy2 + ly)) * {m[2]}u;
+                    for (int lz = 0; lz < {w}; ++lz) {{
+                        int uz = oz2 + lz;
+                        if (uz < 0 || uz >= msz) continue;
+                        float wz = k1_es((float)lz - fz);
+                        uint cell = rowc + (uint)uz;
+                        tg_fadd(&tile[2u*cell],    yre * wz);
+                        tg_fadd(&tile[2u*cell+1u], yim * wz);
+                    }}
+                }}
+"""
+        src += f"""            }}
+        }}
+        metal::simdgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+        if (metal::simd_is_first())
+            v0 = atomic_fetch_add_explicit(&wk, {32 * ilp}u,
+                                           memory_order_relaxed);
+        v0 = metal::simd_broadcast_first(v0);
+    }}
+"""
+        # flush: plain stores to the exclusively-owned cells
+        src += f"""    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint q = tid; q < {mtot}u; q += {TG}u) {{
+"""
+        if dim == 3:
+            src += (f"        int ux = (int)(q / {m[1] * m[2]}u);\n"
+                    f"        uint qr = q % {m[1] * m[2]}u;\n"
+                    f"        int uy = (int)(qr / {m[2]}u), "
+                    f"uz = (int)(qr % {m[2]}u);\n")
+        elif dim == 2:
+            src += (f"        int ux = (int)(q / {m[1]}u), "
+                    f"uy = (int)(q % {m[1]}u);\n")
+        else:
+            src += "        int ux = (int)q;\n"
+        src += ("        if ("
+                + " || ".join(f"u{_AX[d]} >= ms{_AX[d]}" for d in range(dim))
+                + ") continue;\n")
+        gexpr = _linearize([f"(g0{_AX[d]} + u{_AX[d]})" for d in range(dim)],
+                           nu)
+        src += f"""        size_t cell = {gexpr};
+        grid[2*cell]   = as_type<float>(atomic_load_explicit(&tile[2u*q],
+                                            memory_order_relaxed));
+        grid[2*cell+1] = as_type<float>(atomic_load_explicit(&tile[2u*q+1u],
+                                            memory_order_relaxed));
+    }}
+"""
+        innames = (["cj", "perm"] + [f"i1{_AX[d]}" for d in range(dim)]
+                   + [f"fr{_AX[d]}" for d in range(dim)] + ["bin_start"])
+        return mx.fast.metal_kernel(
+            name=f"t1spread{dim}d_odx", input_names=innames,
+            output_names=["grid"],
+            header="#include <metal_simdgroup>\n" + self._TG_FADD + es,
+            source=src)
+
+    def _launch_spread_ex(self, cmx):
+        """Launch the exclusive-ownership spread (no init_value: the region
+        boxes cover every grid cell exactly once)."""
+        nu_tot = int(np.prod(self.n_up))
+        cpf = mx.view(cmx, dtype=mx.float32)
+        return self._spread_ex(
+            inputs=[cpf, self.mx_perm] + self.mx_i1 + self.mx_fr
+                   + [self._mx_bin_start],
+            output_shapes=[(nu_tot * 2,)],
+            output_dtypes=[mx.float32],
+            grid=(self._ODX_TG, self._odx_nreg, 1),
+            threadgroup=(self._ODX_TG, 1, 1))[0]
+
     def _crop_launch(self, B):
         N = self.N
         if self.dim == 3:
@@ -740,8 +1109,10 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
         if cmx.size != self.P:
             raise ValueError(f"c.size ({cmx.size}) must equal the number of "
                              f"nonuniform points ({self.P})")
-        if self._od:
-            # permutation is folded into the kernel (perm-indexed reads)
+        # OD-family kernels fold the permutation in (perm-indexed reads)
+        if self._od_ex:
+            bf = self._launch_spread_ex(cmx)
+        elif self._od:
             cpf = mx.view(cmx, dtype=mx.float32)
             bf = self._spread_od(
                 inputs=[cpf, self.mx_perm] + self.mx_i1 + self.mx_fr
@@ -806,21 +1177,31 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
         # is discarded by the OD bin-sort; here it is simply never run).
         if backend == "gpu":
             i1_g, fr_g = self._compute_cells_gpu(x64)
-            if self._od:
-                if not self._od_prepare_gpu(self._OD_MSUB, i1_g, fr_g):
-                    self._od = False            # no longer OD-eligible (e.g. P)
+            if self._od_ex and \
+                    not self._odx_prepare_gpu(self._odx_m, i1_g, fr_g):
+                self._od_ex = False   # no longer eligible (P, clustering)
+                self._od = self._od_prepare_gpu(self._OD_MSUB, i1_g, fr_g)
+                if self._od:
+                    self._spread_od = self._build_od_spread(self._es)
+            elif self._od and \
+                    not self._od_prepare_gpu(self._OD_MSUB, i1_g, fr_g):
+                self._od = False            # no longer OD-eligible (e.g. P)
+            if not (self._od_ex or self._od):
+                if self._spread is None:
                     self._spread = self._build_gm_spread()
-                    self._sort_and_upload_gpu(i1_g, fr_g)
-            else:
                 self._sort_and_upload_gpu(i1_g, fr_g)
         else:
             self._compute_cells(x64)
-            if self._od:
-                if not self._od_prepare(self._OD_MSUB):
-                    self._od = False
+            if self._od_ex and not self._odx_prepare(self._odx_m):
+                self._od_ex = False
+                self._od = self._od_prepare(self._OD_MSUB)
+                if self._od:
+                    self._spread_od = self._build_od_spread(self._es)
+            elif self._od and not self._od_prepare(self._OD_MSUB):
+                self._od = False
+            if not (self._od_ex or self._od):
+                if self._spread is None:
                     self._spread = self._build_gm_spread()
-                    self._sort_and_upload()
-            else:
                 self._sort_and_upload()
         return self
 

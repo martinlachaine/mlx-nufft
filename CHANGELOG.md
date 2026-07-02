@@ -15,6 +15,14 @@ documented fp32 atomic-ordering noise.
   batches with cooperatively staged per-point 1D kernel weights and a flat
   tap loop (two threadgroup barriers per batch instead of one per point;
   all 256 lanes busy). 2D M=1e7 spread 14.3 -> 5.0 ms.
+- 1D type-1 spread switched to an exclusive-ownership (gather-formulation)
+  kernel: each threadgroup owns an unpadded region of the fine grid
+  outright, scans its three neighbour bins simdgroup-autonomously, and
+  flushes with plain stores — no global atomics and no output zero-init
+  (1D M=1e7 spread 3.8 -> 2.0 ms, whole 5.6 -> 3.6 ms). The same kernel
+  measures at par in 2D and slower in 3D (neighbour-scan and staging
+  duplication exceed the padded kernel's flush budget), so dims 2-3 keep
+  the padded-tile spread.
 - Type-3 non-slab point kernels ported to the same output-driven machinery
   (w=9 tiles), with a zero-skip tile flush; targets are cell-sorted at plan
   time and gathered perm-indexed with the postphase folded in
