@@ -1,4 +1,4 @@
-# mlx-nufft — non-uniform FFTs on Apple GPUs (Metal/MLX)
+# mlx-nufft: non-uniform FFTs on Apple GPUs (Metal/MLX)
 
 [![tests](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml/badge.svg)](https://github.com/martinlachaine/mlx-nufft/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/mlx-nufft.svg)](https://pypi.org/project/mlx-nufft/)
@@ -8,16 +8,18 @@
 [![Platform](https://img.shields.io/badge/platform-Apple%20silicon-lightgrey.svg)](#install)
 [![Backend: MLX](https://img.shields.io/badge/backend-MLX%200.31.2-orange.svg)](https://github.com/ml-explore/mlx)
 
-mlx-nufft computes non-uniform fast Fourier transforms — types 1, 2 and 3, in
-dimensions 1, 2 and 3 — on Apple-silicon GPUs via Metal/MLX, with a drop-in
+mlx-nufft computes non-uniform fast Fourier transforms, types 1, 2 and 3 in
+dimensions 1, 2 and 3, on Apple-silicon GPUs via Metal/MLX, with a drop-in
 mirror of the `finufft` Python API. It runs an fp32 GPU pipeline with the
 precision-critical coordinate setup performed in double precision at plan time
 ("crit64"), so it reaches fp64-grade accuracy on hardware that has no native
 double precision.
 
-> **Paper:** [`mlx-nufft.pdf`](mlx-nufft.pdf) — a technical report
+> **Paper:** [`mlx-nufft.pdf`](mlx-nufft.pdf), a technical report
 > describing the method, accuracy, and performance (types 1/2/3 in 1/2/3D, the
 > crit64 precision mechanism, and M1 / M5 Max benchmarks).
+> The performance figures in the report reflect v0.1 and predate the v0.2
+> speedups; see `CHANGELOG.md` for current numbers.
 > Pin a tagged release rather than tracking `main`.
 
 ## Install
@@ -31,13 +33,13 @@ pip install mlx-nufft
 Or pin a tagged release straight from GitHub:
 
 ```bash
-pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.1.2"
+pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.2.0"
 ```
 
 then `import mlx_nufft`. Dependencies are pinned (notably `mlx==0.31.2`).
 
-For development — running the test/benchmark harness, which uses CPU `finufft`
-and `scipy` as references:
+For development, and to run the test and benchmark harness that uses CPU
+`finufft` and `scipy` as references:
 
 ```bash
 git clone https://github.com/martinlachaine/mlx-nufft && cd mlx-nufft
@@ -45,8 +47,8 @@ uv venv --python 3.13 .venv
 uv pip install -p .venv/bin/python -e ".[dev]"
 ```
 
-Verify the install — run the full correctness suite (each test compares against
-CPU `finufft` and/or an exact direct-summation oracle):
+Verify the install by running the full correctness suite (each test compares
+against CPU `finufft` and/or an exact direct-summation oracle):
 
 ```bash
 .venv/bin/python harness/run_tests.py
@@ -58,8 +60,8 @@ optional VkFFT backend test reports `SKIP` unless the bridge in
 
 ## Quickstart
 
-A complete, copy-paste-runnable 2-D type-1 transform (M nonuniform points →
-`N1 × N2` uniform Fourier modes):
+A complete, copy-paste-runnable 2-D type-1 transform (M nonuniform points to a
+`N1 × N2` grid of uniform Fourier modes):
 
 ```python
 import numpy as np
@@ -75,7 +77,7 @@ fk = finufft.nufft2d1(x, y, c, (N1, N2), eps=1e-6)         # -> (256, 256) compl
 ```
 
 A fuller runnable script (basic call, plan reuse, and a self-check against an
-exact direct DFT — no `finufft` install needed) is in
+exact direct DFT, no `finufft` install needed) is in
 [`examples/quickstart.py`](examples/quickstart.py):
 
 ```bash
@@ -95,8 +97,8 @@ plan.setpts(x, y)
 fk = plan.execute(c)
 ```
 
-Native plan classes — `Type3Plan` (type-3 engine) and `Type1PlanND` /
-`Type2PlanND` (dims 1–3):
+Native plan classes are `Type3Plan` (the type-3 engine) and `Type1PlanND` /
+`Type2PlanND` (dims 1 to 3):
 
 ```python
 from mlx_nufft import Type3Plan
@@ -146,16 +148,16 @@ the bridge is built.
 
 ## Layout
 
-- `mlx_nufft/` — the library: `gpu_t3.py` (type-3 engine), `nd.py`
+- `mlx_nufft/`, the library: `gpu_t3.py` (type-3 engine), `nd.py`
   (`Type1PlanND`/`Type2PlanND`), `types12.py`, `dfmath.py` (the `expi` /
   double-single primitive), `sizing.py` (kernel/grid sizing), `api.py` (the
-  `finufft`-compatible surface), `vkfft_backend.py`.
-- `examples/` — runnable, dependency-light usage examples
+  `finufft`-compatible surface), and `vkfft_backend.py`.
+- `examples/`: runnable, dependency-light usage examples
   (`quickstart.py`).
-- `harness/` — correctness tests (`test_*.py`), the suite runner
+- `harness/`: correctness tests (`test_*.py`), the suite runner
   (`run_tests.py`), the acceptance/benchmark runner, and the CPU-reference
   oracle.
-- `vkfft_bridge/` — optional VkFFT-Metal backend build.
+- `vkfft_bridge/`: optional VkFFT-Metal backend build.
 
 ## Development and validation
 
@@ -165,13 +167,13 @@ are the author's; generative AI tools accelerated implementation, refactoring,
 test scaffolding, and documentation.
 
 Generated code was not trusted by default. Every component was validated against
-independent references — CPU FINUFFT, exact direct-summation oracles on small
+independent references: CPU FINUFFT, exact direct-summation oracles on small
 problems, transform-convention and adjoint checks, full dimension/type coverage,
 dtype/device behavior, and API-parity tests (see `harness/`).
 
-The author is responsible for the released software — its design, limitations,
-and maintenance. Known limitations and hardware assumptions are documented;
-corrections are welcome via the issue tracker.
+The author is responsible for the released software, including its design,
+limitations, and maintenance. Known limitations and hardware assumptions are
+documented; corrections are welcome via the issue tracker.
 
 ## License & citation
 
