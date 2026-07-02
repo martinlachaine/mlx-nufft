@@ -4,8 +4,9 @@
 
 Performance release: 1.4–2.8x faster whole-transform execution across types
 and dimensions on Apple silicon (measured on M5 Max, 128 GB; default MLX
-backend, identical accuracy gates). No API changes; numerical results agree
-with the previous release within the documented fp32 atomic-ordering noise.
+backend, identical accuracy gates). No breaking API changes (additive kwargs
+only); numerical results agree with the previous release within the
+documented fp32 atomic-ordering noise.
 
 - ES spreading kernel evaluated via `metal::fast::exp2`/`fast::sqrt`
   (end-to-end rel-L2 1.70e-6 vs 1.55e-6 at eps=1e-6 — below the fp32
@@ -29,6 +30,23 @@ with the previous release within the documented fp32 atomic-ordering noise.
   conversions no longer copy complex64 arrays. Peak execute memory is
   unchanged (type 3) or lower (types 1/2: progressive crop trims the
   intermediates, 6.3 -> 4.0 GiB on the 3D M=1e7 case).
+- Type-2 gather: the threadgroup-tiled OD interp is replaced by a
+  CELL-SORTED NAIVE gather (per-target thread over cell-sorted targets,
+  perm-indexed output write so caller order stays free) — the round-1
+  type-3 finding holds for type 2 at every measured density: Apple's L1/L2
+  dedups the overlapping w^d neighbourhood reads without explicit staging
+  (3D 256^3 gather 21 -> 4 ms at M=1e6, 28 -> 16 ms at M=1e7; 2D/1D tie).
+  Outputs are bit-identical between the two gathers;
+  `spread_method="od"` retains the tiled path. The internal gather sort
+  applies regardless of `sort_points`, which keeps governing only the
+  type-1 source-side semantics.
+- ND plan construction fast path: `points_backend="auto"|"host"|"gpu"` on
+  `Type1PlanND`/`Type2PlanND` (default auto = gpu) routes `__init__` point
+  setup through the df64 Metal + `mx.argsort` path already validated by
+  `set_sources(backend="gpu")`; ES cell indices are bit-identical to the
+  host fp64 path. 3D M=1e7 plan build ~5.6 s -> 0.05 s (type 1),
+  ~2.9 s -> 0.04 s (type 2); `"host"` preserves the numpy setup for exact
+  reproducibility.
 - Optional VkFFT backend extended with a whole-array 1D/2D/3D in-place FFT:
   `fft_backend="vkfft"` now also covers the non-slab type-3 inner-grid FFT
   (640^3: 54 -> 36 ms; whole t3 generic P=1e6 94 -> 78 ms). Still opt-in;
