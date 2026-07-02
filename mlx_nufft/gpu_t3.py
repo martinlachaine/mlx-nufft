@@ -22,7 +22,8 @@ correspondingly wider interp kernel) to cut the dominant memory term.
 import numpy as np
 import mlx.core as mx
 
-from .sizing import kernel_params, kernel_ft, set_nhg_type3, next235even
+from .sizing import (kernel_params, kernel_ft, kernel_ft_fast,
+                     set_nhg_type3, next235even)
 
 PI = np.pi
 
@@ -492,7 +493,7 @@ class GpuT3Plan:
         # ---- deconvolution (host fp64) ------------------------------------
         tdec = np.ones(self.M, dtype=np.float64)
         for d in range(3):
-            tdec *= kernel_ft(theta64[d], self.beta, w)
+            tdec *= kernel_ft_fast(theta64[d], self.beta, w)
         post = (postphase / tdec).astype(np.complex64)
 
         decs = []
@@ -510,13 +511,17 @@ class GpuT3Plan:
                 scale *= float(self.n_up[2])
             decs[0] = decs[0] * scale
         # z-DFT twiddle table tw[l3, m3] = exp(i*isign*2*pi*r3(m3)*l3/nu3),
-        # with r3 the FFT-wrapped index of mode q3 = m3 - nf3/2 (fp64 host)
-        nf3, nu3 = self.nf[2], self.n_up[2]
-        q3 = np.arange(-nf3 // 2, nf3 // 2)
-        r3 = np.where(q3 < 0, q3 + nu3, q3)[None, :].astype(np.float64)
-        l3 = np.arange(nu3, dtype=np.float64)[:, None]
-        tw = np.exp(2j * PI * self.isign * r3 * l3 / nu3).astype(np.complex64)
-        self._tw_np = tw
+        # with r3 the FFT-wrapped index of mode q3 = m3 - nf3/2 (fp64 host).
+        # Only the slab pipeline (fused pad+zDFT) reads it.
+        if self.slab_mode:
+            nf3, nu3 = self.nf[2], self.n_up[2]
+            q3 = np.arange(-nf3 // 2, nf3 // 2)
+            r3 = np.where(q3 < 0, q3 + nu3, q3)[None, :].astype(np.float64)
+            l3 = np.arange(nu3, dtype=np.float64)[:, None]
+            self._tw_np = np.exp(2j * PI * self.isign * r3 * l3
+                                 / nu3).astype(np.complex64)
+        else:
+            self._tw_np = None
 
         # ---- upload frozen target-side plan arrays to mx ------------------
         self.mx_ti1 = [mx.array(v) for v in self.t_i1]
@@ -525,12 +530,14 @@ class GpuT3Plan:
             np.stack([post.real.astype(np.float32),
                       post.imag.astype(np.float32)], axis=-1)))
         self.mx_dec = [mx.array(v.astype(np.float32)) for v in decs]
-        self.mx_tw = mx.array(np.ascontiguousarray(
-            np.stack([self._tw_np.real, self._tw_np.imag], axis=-1)
+        self.mx_tw = None if self._tw_np is None else mx.array(
+            np.ascontiguousarray(
+                np.stack([self._tw_np.real, self._tw_np.imag], axis=-1)
             ).astype(np.float32))
         self.mx_post_c = mx.array(post)
-        mx.eval(self.mx_post, self.mx_tw, self.mx_post_c,
-                *self.mx_ti1, *self.mx_tfr, *self.mx_dec)
+        mx.eval(self.mx_post, self.mx_post_c,
+                *self.mx_ti1, *self.mx_tfr, *self.mx_dec,
+                *([] if self.mx_tw is None else [self.mx_tw]))
 
         self._twiddles = {}
         self._twt_kernels = {}
@@ -567,7 +574,12 @@ class GpuT3Plan:
         self._df64_setup = None
         self._ods = None            # source-side OD tables (set_sources)
         self._prepare_od_targets()  # target-side cell sort (frozen)
-        self.set_sources(x)   # source-side state (+ kernel build)
+        # crit64 plans take the validated df64 GPU source setup (~10x less
+        # host time); the other precision modes are DEFINED by their host
+        # rounding behavior and keep the host path. Host numpy mirrors
+        # (self.perm/i1/fr) stay unmaterialized on the gpu path — call
+        # set_sources(x, backend="host") to rebuild them if needed.
+        self.set_sources(x, backend="gpu" if prec == "crit64" else "host")
 
     # ------------------------------------------------------------------
     def _prepare_od_targets(self):
@@ -580,12 +592,24 @@ class GpuT3Plan:
         if self.slab_mode or self.M < _OD_MIN_PTS:
             return
         nu1, nu2, nu3 = self.n_up
-        key = ((self.t_i1[0].astype(np.int64) * nu2 + self.t_i1[1]) * nu3
-               + self.t_i1[2])
-        gperm = np.argsort(key, kind="stable")
-        self.mx_gperm = mx.array(gperm.astype(np.uint32))
-        self.mx_gi1 = [mx.array(v[gperm]) for v in self.t_i1]
-        self.mx_gfr = [mx.array(v[gperm]) for v in self.t_fr]
+        if nu1 * nu2 * nu3 <= _MK_MAX_ELEMS:
+            # GPU sort over the already-uploaded mirrors. The key order only
+            # steers gather locality (results are written out[2*jp]), so the
+            # unstable mx sort is as good as the host stable one.
+            key = ((self.mx_ti1[0] * nu2 + self.mx_ti1[1]) * nu3
+                   + self.mx_ti1[2])
+            gperm = mx.argsort(key).astype(mx.uint32)
+            self.mx_gperm = gperm
+            self.mx_gi1 = [mx.take(v, gperm) for v in self.mx_ti1]
+            self.mx_gfr = [mx.take(v, gperm) for v in self.mx_tfr]
+        else:
+            # int32 cell key would wrap: host int64 sort
+            key = ((self.t_i1[0].astype(np.int64) * nu2 + self.t_i1[1]) * nu3
+                   + self.t_i1[2])
+            gperm = np.argsort(key, kind="stable")
+            self.mx_gperm = mx.array(gperm.astype(np.uint32))
+            self.mx_gi1 = [mx.array(v[gperm]) for v in self.t_i1]
+            self.mx_gfr = [mx.array(v[gperm]) for v in self.t_fr]
         mx.eval(self.mx_gperm, *self.mx_gi1, *self.mx_gfr)
         self._tgt_sorted = True
 

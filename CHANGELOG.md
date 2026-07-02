@@ -33,6 +33,15 @@ with the previous release within the documented fp32 atomic-ordering noise.
   `fft_backend="vkfft"` now also covers the non-slab type-3 inner-grid FFT
   (640^3: 54 -> 36 ms; whole t3 generic P=1e6 94 -> 78 ms). Still opt-in;
   MLX remains the validated default.
+- Type-3 plan construction ~20x faster (generic N=1024, M=P=1e6: 2.3 s ->
+  ~0.1 s), which is most of one-shot `nufft3d3` latency: the M-point
+  ES-kernel Fourier transform behind the target deconvolution is evaluated
+  through a cached fp64 Chebyshev fit validated to <= 1e-12 relative against
+  the 128-node quadrature (falls back to the quadrature whenever the fit
+  cannot certify that bound); crit64 plans route their initial source setup
+  through the validated df64 GPU path; the target cell sort runs on the GPU.
+  tdec deviation at plan targets <= 1.2e-13 relative; end-to-end accuracy
+  unchanged (anisotropic subset-oracle rel-L2 1.51e-5 -> 1.49e-5).
 
 ## v0.1.3 — 2026-06-28
 

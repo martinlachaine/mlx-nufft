@@ -85,6 +85,62 @@ def kernel_ft(xi, beta, w, nquad=128):
     return 2.0 * (wq * vals) @ np.cos(np.outer(d, xi))
 
 
+# ---- fast M-point kernel_ft: cached Chebyshev fit per (beta, w, nquad) ---
+# Every caller needs |xi| <= pi/upsampfac < pi (type-3 rescaled targets and
+# 2*pi*q/n_up mode arguments both live there), so one fit over [0, pi]
+# serves all plans sharing kernel parameters. phihat is even and entire, so
+# it is fit in t = 2*(xi/pi)^2 - 1 (even symmetry halves the degree).
+_CHEB_XMAX = PI
+_CHEB_TOL = 1e-12          # relative to the nquad-node quadrature
+_CHEB_DEGS = (16, 24, 32, 48, 64, 96, 128)
+_CHEB_CACHE = {}
+
+
+def _kernel_ft_cheb(beta, w, nquad):
+    """Chebyshev coefficients matching kernel_ft to <= _CHEB_TOL relative on
+    a dense probe of [0, pi], or None when no degree validates (wide kernels
+    whose dynamic range puts the quadrature's own fp64 cancellation noise
+    above the tolerance) — callers then keep the quadrature path."""
+    key = (float(beta), int(w), int(nquad))
+    if key in _CHEB_CACHE:
+        return _CHEB_CACHE[key]
+    cheb = np.polynomial.chebyshev
+    probe = np.linspace(0.0, _CHEB_XMAX, 4097)
+    ref = kernel_ft(probe, beta, w, nquad)
+    co = None
+    if (ref > 0.0).all():              # relative gate needs a positive band
+        tp = 2.0 * (probe / _CHEB_XMAX) ** 2 - 1.0
+
+        def g(t):
+            xi = _CHEB_XMAX * np.sqrt(0.5 * (t + 1.0))
+            return kernel_ft(xi, beta, w, nquad)
+
+        for deg in _CHEB_DEGS:
+            cand = cheb.chebinterpolate(g, deg)
+            if (np.abs(cheb.chebval(tp, cand) - ref)
+                    <= _CHEB_TOL * ref).all():
+                co = cand
+                break
+    _CHEB_CACHE[key] = co
+    return co
+
+
+def kernel_ft_fast(xi, beta, w, nquad=128):
+    """kernel_ft via the cached Chebyshev fit: O(degree) fma per point vs
+    O(nquad) cos. Falls back to the quadrature when the fit cannot validate,
+    and per-point for any |xi| beyond the fitted [0, pi] range."""
+    xi = np.atleast_1d(np.asarray(xi, dtype=np.float64))
+    co = _kernel_ft_cheb(beta, w, nquad)
+    if co is None:
+        return kernel_ft(xi, beta, w, nquad)
+    t = (2.0 / (_CHEB_XMAX * _CHEB_XMAX)) * (xi * xi) - 1.0
+    out = np.polynomial.chebyshev.chebval(t, co)
+    oob = t > 1.0
+    if oob.any():
+        out[oob] = kernel_ft(xi[oob], beta, w, nquad)
+    return out
+
+
 def set_nhg_type3(S, X, upsampfac, w):
     """Port of FINUFFT set_nhg_type3 for one dimension.
 

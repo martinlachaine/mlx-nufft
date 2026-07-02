@@ -105,6 +105,7 @@ if __name__ == "__main__":
 
     plan = GpuT3Plan(x, s, eps=1e-5, isign=+1, prec="crit64",
                      sort_points=False)
+    plan.set_sources(x, backend="host")   # materialize host mirrors (i1/fr)
     kern = mx.fast.metal_kernel(
         name="df64setup", input_names=["xhi", "xlo", "cst", "P0"],
         output_names=["i1o", "fro", "pre"], header=HDR, source=SRC)
