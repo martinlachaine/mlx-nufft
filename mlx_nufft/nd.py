@@ -94,9 +94,12 @@ def _build_t1_df64_setup_kernel(dim):
 class _PointsND:
     """Shared point/kernel setup for ND types 1 and 2."""
 
-    def __init__(self, x, n_modes, eps, isign, upsampfac, prec, sort_points):
+    def __init__(self, x, n_modes, eps, isign, upsampfac, prec, sort_points,
+                 points_backend="auto"):
         if prec not in ("fp32", "crit64"):
             raise ValueError("prec must be 'fp32' or 'crit64'")
+        if points_backend not in ("auto", "host", "gpu"):
+            raise ValueError("points_backend must be 'auto', 'host' or 'gpu'")
         if isinstance(x, np.ndarray) and x.ndim == 1:
             x = (x,)
         x = tuple(x)
@@ -131,7 +134,18 @@ class _PointsND:
         if not all(v.size == self.P for v in x64):
             raise ValueError("coordinate arrays must have equal length")
         self._sort_points = bool(sort_points)
-        self._set_points_arrays(x64)
+        # "auto" resolves to the GPU point setup: df64 Metal cells +
+        # mx.argsort, crit64-grade with i1 bit-exact vs the host fp64 path
+        # regardless of prec. "host" keeps the numpy setup for exact
+        # reproducibility of pre-existing plans. On the GPU path the
+        # sort/upload is finished by the plan-type __init__ once the
+        # OD/gather decision is made (no wasted lateral sort).
+        self._points_backend = "host" if points_backend == "host" else "gpu"
+        if self._points_backend == "gpu":
+            self._pending_gpu = self._compute_cells_gpu(x64)
+        else:
+            self._pending_gpu = None
+            self._set_points_arrays(x64)
 
         # mode deconvolution: 1/phihat(2 pi k / n_up); uncentered fine grid
         # (u_l = l*h, x folded into [0, 2pi)) => no (-1)^k half-grid factor.
@@ -238,6 +252,21 @@ class _PointsND:
         mx.eval(self.mx_perm, *self.mx_i1, *self.mx_fr)
         self.perm = np.array(self.mx_perm).astype(np.intp)
         self.sorted = self._sort_points
+
+    def _finish_points_od(self, want_od, msub):
+        """Finish __init__-time point setup once the plan type has made its
+        OD decision: OD bin-sort tables when requested and applicable, else
+        the lateral sort, on whichever backend produced the cells (the host
+        path already holds its lateral sort from _set_points_arrays).
+        Returns True when the OD tables were built."""
+        if self._pending_gpu is not None:
+            i1_g, fr_g = self._pending_gpu
+            self._pending_gpu = None
+            od = want_od and self._od_prepare_gpu(msub, i1_g, fr_g)
+            if not od:
+                self._sort_and_upload_gpu(i1_g, fr_g)
+            return od
+        return want_od and self._od_prepare(msub)
 
     # -- kernel-source builders (shared by both plan types) ---------------
 
@@ -372,8 +401,10 @@ class Type1PlanND(_PointsND):
     """f[k] = sum_j c[j] exp(i*isign * k . x_j), modeord=0 box, dims 1-3."""
 
     def __init__(self, x, n_modes, eps=1e-6, isign=+1, upsampfac=2.0,
-                 prec="crit64", sort_points=True, spread_method="auto"):
-        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points)
+                 prec="crit64", sort_points=True, spread_method="auto",
+                 points_backend="auto"):
+        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points,
+                         points_backend)
         dim, w, P = self.dim, self.w, self.P
         nu = self.n_up
         N = self.N
@@ -384,7 +415,7 @@ class Type1PlanND(_PointsND):
         # at w <= 4 the direct atomic spread is equally fast and simpler.
         want_od = (spread_method == "od"
                    or (spread_method == "auto" and w >= 5))
-        self._od = want_od and self._od_prepare(self._OD_MSUB)
+        self._od = self._finish_points_od(want_od, self._OD_MSUB)
         if spread_method == "od" and not self._od:
             raise ValueError("OD spreading not applicable to this geometry")
         if self._od:
@@ -956,21 +987,40 @@ class Type2PlanND(_PointsND):
     """c[j] = sum_k f[k] exp(i*isign * k . x_j), modeord=0 box, dims 1-3."""
 
     def __init__(self, x, n_modes, eps=1e-6, isign=-1, upsampfac=2.0,
-                 prec="crit64", sort_points=False, spread_method="auto"):
-        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points)
+                 prec="crit64", sort_points=False, spread_method="auto",
+                 points_backend="auto"):
+        super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points,
+                         points_backend)
         dim, w, P = self.dim, self.w, self.P
         nu = self.n_up
         N = self.N
         es = _es_msl("k2", w, self.beta)
 
         assert spread_method in ("auto", "od", "gm")
-        # interp has no atomics/barrier-per-point: whole bins as subproblems
-        # so each bin's tile is loaded from the fine grid exactly once
-        self._od = (spread_method != "gm") and self._od_prepare(1 << 22)
-        if spread_method == "od" and not self._od:
-            raise ValueError("OD interp not applicable to this geometry")
-        if self._od:
+        # Gather strategy: the CELL-SORTED NAIVE gather (per-target thread
+        # over cell-sorted targets, perm-indexed output write) beats the
+        # threadgroup-tiled OD gather at every measured density — Apple's
+        # L1/L2 dedups the overlapping w^d neighbourhood reads without
+        # explicit staging (same finding as the round-1 type-3 engine).
+        # "auto" ships it; "od" keeps the tiled path (whole bins as
+        # subproblems so each tile loads exactly once); "gm" keeps the
+        # sort_points-order naive path. The gather sort/perm is INTERNAL
+        # (output written perm-indexed -> caller order preserved);
+        # sort_points keeps governing only the type-1 source-side semantics.
+        self._gather_sorted = False
+        self._od = False
+        if spread_method == "od":
+            self._od = self._finish_points_od(True, 1 << 22)
+            if not self._od:
+                raise ValueError("OD interp not applicable to this geometry")
             self._gather_od = self._build_od_gather(es)
+        elif spread_method == "auto":
+            self._cell_sort_targets()
+            self._gather_sorted = True
+        elif self._pending_gpu is not None:      # gm: lateral sort, gpu cells
+            i1_g, fr_g = self._pending_gpu
+            self._pending_gpu = None
+            self._sort_and_upload_gpu(i1_g, fr_g)
 
         # ---- axis-0 pad + deconvolve (fused) -----------------------------
         # _modes_to_grid FFTs axis 0 first, on a grid still cropped in every
@@ -1019,10 +1069,52 @@ class Type2PlanND(_PointsND):
             output_names=["H"], source=src)
 
         # ---- gather/interp ------------------------------------------------
+        self._gather = None if self._od else self._build_gather(
+            es, sorted_write=self._gather_sorted)
+
+    def _cell_sort_targets(self):
+        """Sort targets by FULL lexicographic cell key (all dims) and upload
+        — the gather-side order for the cell-sorted naive gather. The perm
+        is internal: the gather writes out[2*perm[kk]] so results stay in
+        caller order with no un-permutation pass."""
+        nu = self.n_up
+        if self._pending_gpu is not None:
+            i1_g, fr_g = self._pending_gpu
+            self._pending_gpu = None
+            key = i1_g[0].astype(mx.int64) \
+                if int(np.prod([float(n) for n in nu])) > 2**31 - 1 \
+                else i1_g[0]
+            for d in range(1, self.dim):
+                key = key * nu[d] + i1_g[d]
+            self.mx_perm = mx.argsort(key).astype(mx.uint32)
+            self.mx_i1 = [mx.take(v, self.mx_perm) for v in i1_g]
+            self.mx_fr = [mx.take(v, self.mx_perm) for v in fr_g]
+            mx.eval(self.mx_perm, *self.mx_i1, *self.mx_fr)
+            self.perm = np.array(self.mx_perm).astype(np.intp)
+        else:
+            key = self.i1[0].astype(np.int64)
+            for d in range(1, self.dim):
+                key = key * nu[d] + self.i1[d]
+            self.perm = np.argsort(key, kind="stable")
+            self.mx_perm = mx.array(self.perm.astype(np.uint32))
+            self.mx_i1 = [mx.array(v[self.perm]) for v in self.i1]
+            self.mx_fr = [mx.array(v[self.perm]) for v in self.fr]
+        self.sorted = True
+
+    def _build_gather(self, es, sorted_write=False):
+        """Naive per-target interp: one thread gathers a whole point.
+        sorted_write reads the cell-SORTED point arrays and writes the
+        result perm-indexed (caller order free); neighbouring threads then
+        interp overlapping w^d neighbourhoods of the fine grid, which
+        L1/L2 serves without threadgroup staging."""
+        dim, w, P = self.dim, self.w, self.P
+        nu = self.n_up
         src = f"""
     uint kk = thread_position_in_grid.x;
     if (kk >= {P}u) return;
 """
+        if sorted_write:
+            src += "    uint jp = perm[kk];\n"
         for d in range(dim):
             a = _AX[d]
             src += f"""    float w{a}[{w}];
@@ -1074,13 +1166,16 @@ class Type2PlanND(_PointsND):
         }}
     }}
 """
-        src += """    out[2*kk]   = accre;
-    out[2*kk+1] = accim;
+        dst = "jp" if sorted_write else "kk"
+        src += f"""    out[2*{dst}]   = accre;
+    out[2*{dst}+1] = accim;
 """
-        innames = (["v"] + [f"ti1{_AX[d]}" for d in range(dim)]
+        innames = (["v"] + (["perm"] if sorted_write else [])
+                   + [f"ti1{_AX[d]}" for d in range(dim)]
                    + [f"tfr{_AX[d]}" for d in range(dim)])
-        self._gather = None if self._od else mx.fast.metal_kernel(
-            name=f"t2gather{dim}d", input_names=innames,
+        return mx.fast.metal_kernel(
+            name=f"t2gather{dim}d" + ("_srt" if sorted_write else ""),
+            input_names=innames,
             output_names=["out"], header="#include <metal_math>\n" + es,
             source=src)
 
@@ -1248,14 +1343,17 @@ class Type2PlanND(_PointsND):
                 grid=(self._OD_TG, self._od_nsub, 1),
                 threadgroup=(self._OD_TG, 1, 1))[0]
         else:
+            # sorted gather: output written perm-indexed -> caller order
+            ins = ([vf] + ([self.mx_perm] if self._gather_sorted else [])
+                   + self.mx_i1 + self.mx_fr)
             out = self._gather(
-                inputs=[vf] + self.mx_i1 + self.mx_fr,
+                inputs=ins,
                 output_shapes=[(self.P * 2,)],
                 output_dtypes=[mx.float32],
                 grid=(max(self.P, 1), 1, 1), threadgroup=(256, 1, 1))[0]
         del H, vf
         res = mx.view(out, dtype=mx.complex64)
-        if self.sorted and not self._od:
+        if self.sorted and not self._od and not self._gather_sorted:
             # restore caller point order (GM path computed in sorted order)
             if not hasattr(self, "_mx_inv"):
                 inv = np.empty_like(self.perm)
