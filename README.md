@@ -143,7 +143,7 @@ the bridge is built.
 - Types 1 and 2 in 3D default to upsampling factor 1.25 on grids of at least
   32768 modes when `eps` is 1e-4 or looser (type 2) or 1e-3 or looser (type 1,
   and 1e-4 on grids of 2^24 modes or more). At eps=1e-3 this runs about 2x
-  faster with an achieved error 1.5 to 1.6 times the sigma-2 result, in the
+  faster with an achieved error 1.5 to 1.7 times the sigma-2 result, in the
   same eps bracket. Pass `upsampfac=2.0` to keep the finufft default.
 - Type 3 runs at upsampling factor 1.25 with the kernel width capped at 8 on
   full 3D grids (FINUFFT's single-precision rule), so its achievable error is
