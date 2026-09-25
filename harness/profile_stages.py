@@ -53,7 +53,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import mlx_nufft                                             # noqa: E402
 from mlx_nufft.nd import Type1PlanND, Type2PlanND            # noqa: E402
-from mlx_nufft.gpu_t3 import GpuT3Plan, fft_axis             # noqa: E402
+from mlx_nufft.gpu_t3 import (GpuT3Plan, fft_axis,           # noqa: E402
+                              fft_grid_stages)
 from harness.bench_gpu import machine                        # noqa: E402
 from harness.gen import gen_generic, rel_l2                  # noqa: E402
 
@@ -235,9 +236,11 @@ def t3_stages(plan, c):
         H = plan._fft3_vkfft(H)
         yield "fft_xyz", H
     else:
-        for ax in (2, 1, 0):
-            Hn = fft_axis(H, ax, inverse=plan.isign > 0,
-                          twiddle_cache=plan._twiddles)
+        # same per-axis chain as execute (FFT_STRATEGY, _SMALL_AXIS_DFT and
+        # the fused twiddle all apply); under "transpose" the fft_x stage
+        # includes the final transpose back to natural order
+        for ax, Hn in fft_grid_stages(H, plan.isign > 0, plan._twiddles,
+                                      eager=True):
             del H
             H = Hn
             del Hn
