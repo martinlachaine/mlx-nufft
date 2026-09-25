@@ -24,6 +24,10 @@ Differences (documented, not silent):
     warning (the fp32 accuracy envelope: see ACCEPTANCE.md);
   - complex128 inputs are accepted and returned as complex128, but the
     transform itself is fp32-grade;
+  - upsampfac defaults to None ("auto"; finufft's 0 is the same): 2.0
+    except for 3D types 1/2 at loose tolerances, which take 1.25 (the
+    policy and its MLX_NUFFT_UPSAMPFAC override are in nd.py); an
+    explicit 2.0 or 1.25 is honored; type 3 always runs sigma=1.25;
   - modeord=1 (FFT ordering) is not implemented (raises);
   - 1D/2D type 3 currently run as degenerate slices of the validated 3D
     type-3 kernel (functional; not speed-tuned).
@@ -50,7 +54,7 @@ def _check_opts(kwargs):
     if opts.pop("modeord", 0) not in (0,):
         raise NotImplementedError("modeord=1 (FFT ordering) not implemented")
     upsampfac = opts.pop("upsampfac", None)
-    if upsampfac in (0, 0.0):                 # finufft auto sentinel
+    if upsampfac in (0, 0.0, "auto"):         # finufft auto sentinel
         upsampfac = None
     prec = opts.pop("prec", "crit64")
     fft_backend = opts.pop("fft_backend", "mlx")   # type-3 only
@@ -190,8 +194,8 @@ def _nufft_t1(dim, coords, c, n_modes, out, eps, isign, kwargs):
     if out is not None and n_modes is None:
         n_modes = _modes_tuple(None, dim, out, out_offset=(1 if n_tr > 1 else 0))
     N = _modes_tuple(n_modes, dim, out)
-    kw = {} if upsampfac is None else {"upsampfac": upsampfac}
-    plan = Type1PlanND(coords, N, eps=eps, isign=isign, prec=prec, **kw)
+    plan = Type1PlanND(coords, N, eps=eps, isign=isign, upsampfac=upsampfac,
+                       prec=prec)
     res = _execute_stack(plan, cv)
     if n_tr == 1 and (np.asarray(c).ndim == 1):
         res = res[0]
@@ -225,8 +229,8 @@ def _nufft_t2(dim, coords, f, out, eps, isign, kwargs):
     dtype = _out_dtype(f)
     n_tr, fv = _vec_shape(f, dim)
     N = fv.shape[1:]
-    kw = {} if upsampfac is None else {"upsampfac": upsampfac}
-    plan = Type2PlanND(coords, N, eps=eps, isign=isign, prec=prec, **kw)
+    plan = Type2PlanND(coords, N, eps=eps, isign=isign, upsampfac=upsampfac,
+                       prec=prec)
     res = np.stack([plan.execute(fv[t]) for t in range(n_tr)])
     if n_tr == 1 and (np.asarray(f).ndim == dim):
         res = res[0]
@@ -337,16 +341,17 @@ class Plan:
         if len(coords) != self.dim:
             raise ValueError(f"expected {self.dim} coordinate arrays, "
                              f"got {len(coords)}")
-        kw = {} if self._upsampfac is None else {"upsampfac": self._upsampfac}
         self._adjoint = None
         if self.type == 1:
             self._plan = Type1PlanND(tuple(coords), self.n_modes,
                                      eps=self.eps, isign=self.isign,
-                                     prec=self._prec, **kw)
+                                     upsampfac=self._upsampfac,
+                                     prec=self._prec)
         elif self.type == 2:
             self._plan = Type2PlanND(tuple(coords), self.n_modes,
                                      eps=self.eps, isign=self.isign,
-                                     prec=self._prec, **kw)
+                                     upsampfac=self._upsampfac,
+                                     prec=self._prec)
         else:
             if self._upsampfac is not None and self._upsampfac != 1.25:
                 warnings.warn("mlx-nufft: type-3 runs the validated "
@@ -391,16 +396,16 @@ class Plan:
             raise RuntimeError("setpts() must be called before "
                                "execute_adjoint()")
         if self._adjoint is None:
-            kw = {} if self._upsampfac is None \
-                else {"upsampfac": self._upsampfac}
             if self.type == 1:
                 self._adjoint = Type2PlanND(tuple(self._coords), self.n_modes,
                                             eps=self.eps, isign=-self.isign,
-                                            prec=self._prec, **kw)
+                                            upsampfac=self._upsampfac,
+                                            prec=self._prec)
             elif self.type == 2:
                 self._adjoint = Type1PlanND(tuple(self._coords), self.n_modes,
                                             eps=self.eps, isign=-self.isign,
-                                            prec=self._prec, **kw)
+                                            upsampfac=self._upsampfac,
+                                            prec=self._prec)
             else:
                 self._adjoint = GpuT3Plan(_embed3(self._targets, self.dim),
                                           _embed3(self._coords, self.dim),
