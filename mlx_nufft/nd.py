@@ -11,16 +11,24 @@ with k_d integer in [-(N_d//2), (N_d-1)//2] (even or odd N_d), x in
 fp32 GPU pipeline; precision-critical coordinate handling in fp64 at plan
 time ('crit64', default) exactly as in types12/gpu_t3.
 
-Default upsampfac=2.0 (FINUFFT's default): at eps=1e-5 the ES kernel width
-is w=6 vs w=9 at sigma=1.25, i.e. w^d-fold fewer spread/interp taps for
-2^d-fold grid memory — the right trade on large-unified-memory machines.
-Pass upsampfac=1.25 to recover the low-memory sizing.
+Default upsampfac=None ("auto") resolves the upsampling factor per plan:
+2.0 (FINUFFT's default: at eps=1e-5 the ES kernel width is w=6 vs w=9 at
+sigma=1.25, i.e. w^d-fold fewer spread/interp taps for 2^d-fold grid
+memory) except in 3D at loose tolerances, where the 2^3-fold smaller grid
+wins on Apple GPUs and the plan takes 1.25: type 2 at eps >=
+UPSAMP_AUTO_EPS_T2, type 1 at eps >= UPSAMP_AUTO_EPS_T1 or at eps >=
+UPSAMP_AUTO_EPS_T1_BIG with at least UPSAMP_AUTO_T1_BIG_MODES modes (the
+constants and the measurements behind them follow PAD_PATH below). An
+explicit upsampfac (2.0 or 1.25) is always honored; the environment
+variable MLX_NUFFT_UPSAMPFAC (auto | 2.0 | 1.25) replaces the resolved
+default for A/B runs. Plans record the value in .upsampfac (and .sigma).
 
 The 3D specialization of this module reproduces types12.py's algorithm
 exactly (same kernels modulo generation); types12.py remains untouched as
 the validated reference implementation.
 """
 
+import logging
 import os
 
 import numpy as np
@@ -30,6 +38,7 @@ from .sizing import kernel_params, kernel_ft_fast, next235even
 from .gpu_t3 import _es_msl, fft_axis, _DF64_HDR, _MK_MAX_ELEMS
 
 PI = np.pi
+_log = logging.getLogger(__name__)
 
 _AX = ("x", "y", "z")
 
@@ -51,6 +60,56 @@ _AX = ("x", "y", "z")
 #            kernels and 2 + (1 - N/nu) output sizes of traffic per pad.
 # Dim 1 has no axis cycle, and both paths run the direct axis-0 kernel.
 PAD_PATH = os.environ.get("MLX_NUFFT_PAD_PATH", "fused")
+
+# ---- default upsampling factor (upsampfac=None / "auto"). Measured on an
+# M5 Max at M=1e6 against CPU FINUFFT fp64 (v0.2.0 code): in 3D the
+# 2^3-fold smaller sigma=1.25 grid beats sigma=2 for type 2 at every eps
+# >= 1e-4 (128^3: 2.42x at 1e-2, 1.93x at 1e-3, 1.74x at 1e-4; 256^3:
+# 2.44x at 1e-3, 2.29x at 1e-4) and for type 1 at eps >= 1e-3 (2.12x /
+# 2.02x at 128^3 / 256^3), while at eps=1e-4 type 1 only pays on
+# 256^3-class grids (1.87x; 0.88x at 128^3); at eps <= 1e-5 the fp32 grid
+# at sigma=1.25 is floor-limited (~5e-5) and sigma=2 stays. 1D and 2D are
+# neutral or worse at sigma=1.25 and keep 2.0. Where 1.25 is taken the
+# error is 1.3x to 1.5x sigma=2's at the same eps (the same eps grade).
+# The environment variable MLX_NUFFT_UPSAMPFAC=auto|2.0|1.25 replaces the
+# resolved default (read when a plan resolves it; an explicit constructor
+# argument wins over it). The rule that fired is logged at DEBUG level.
+UPSAMP_AUTO_MIN_DIM = 3             # sigma=1.25 defaults only from this dim
+UPSAMP_AUTO_EPS_T2 = 1e-4           # type 2: 1.25 at eps >= this
+UPSAMP_AUTO_EPS_T1 = 1e-3           # type 1: 1.25 at eps >= this, or
+UPSAMP_AUTO_EPS_T1_BIG = 1e-4       #   at eps >= this on a grid of
+UPSAMP_AUTO_T1_BIG_MODES = 2 ** 24  #   at least this many modes (256^3)
+UPSAMP_AUTO_LOW = 1.25
+UPSAMP_AUTO_HIGH = 2.0
+UPSAMP_ENV = "MLX_NUFFT_UPSAMPFAC"
+
+
+def _resolve_upsampfac(upsampfac, dim, nufft_type, eps, n_modes):
+    """(upsampfac, rule) for a plan: an explicit value as given (float);
+    None, "auto" and finufft's 0 sentinel take MLX_NUFFT_UPSAMPFAC when it
+    names a value, else the policy above. rule names what decided."""
+    if upsampfac not in (None, "auto", 0, 0.0):
+        return float(upsampfac), "explicit"
+    env = os.environ.get(UPSAMP_ENV, "auto").strip().lower()
+    if env not in ("", "auto"):
+        try:
+            return float(env), f"{UPSAMP_ENV}={env}"
+        except ValueError:
+            raise ValueError(f"{UPSAMP_ENV} must be auto, 2.0 or 1.25, "
+                             f"got {env!r}") from None
+    if dim < UPSAMP_AUTO_MIN_DIM:
+        return UPSAMP_AUTO_HIGH, "dim < UPSAMP_AUTO_MIN_DIM"
+    if nufft_type == 2:
+        if eps >= UPSAMP_AUTO_EPS_T2:
+            return UPSAMP_AUTO_LOW, "type 2, eps >= UPSAMP_AUTO_EPS_T2"
+        return UPSAMP_AUTO_HIGH, "type 2, eps < UPSAMP_AUTO_EPS_T2"
+    if eps >= UPSAMP_AUTO_EPS_T1:
+        return UPSAMP_AUTO_LOW, "type 1, eps >= UPSAMP_AUTO_EPS_T1"
+    if (eps >= UPSAMP_AUTO_EPS_T1_BIG
+            and int(np.prod(n_modes)) >= UPSAMP_AUTO_T1_BIG_MODES):
+        return UPSAMP_AUTO_LOW, ("type 1, eps >= UPSAMP_AUTO_EPS_T1_BIG on "
+                                 ">= UPSAMP_AUTO_T1_BIG_MODES modes")
+    return UPSAMP_AUTO_HIGH, "type 1, eps below the sigma=1.25 thresholds"
 
 
 def _linearize(idx_names, dims):
@@ -211,14 +270,17 @@ class _PointsND:
                              f"dim {self.dim}")
         if any(n < 1 for n in self.N):
             raise ValueError("mode dims must be >= 1")
-        if upsampfac in (None, 0, 0.0):       # finufft auto sentinel
-            upsampfac = 2.0
+        upsampfac, rule = _resolve_upsampfac(upsampfac, self.dim,
+                                             self._NUFFT_TYPE, eps, self.N)
+        _log.debug("%s N=%s eps=%g: upsampfac %g (%s)", type(self).__name__,
+                   self.N, eps, upsampfac, rule)
         if not 1.0 < upsampfac <= 4.0:
             raise ValueError(f"upsampfac must be in (1, 4], got {upsampfac}")
         self.prec = prec
         self.isign = +1 if isign >= 0 else -1   # finufft: non-negative -> +
         self.eps = eps
         self.sigma = upsampfac
+        self.upsampfac = upsampfac              # the resolved factor
         self.w, self.beta = kernel_params(eps, upsampfac, self.dim)
         w = self.w
         self.n_up = [next235even(max(2 * w, int(np.ceil(upsampfac * n))))
@@ -501,7 +563,9 @@ class _PointsND:
 class Type1PlanND(_PointsND):
     """f[k] = sum_j c[j] exp(i*isign * k . x_j), modeord=0 box, dims 1-3."""
 
-    def __init__(self, x, n_modes, eps=1e-6, isign=+1, upsampfac=2.0,
+    _NUFFT_TYPE = 1
+
+    def __init__(self, x, n_modes, eps=1e-6, isign=+1, upsampfac=None,
                  prec="crit64", sort_points=True, spread_method="auto",
                  points_backend="auto"):
         super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points,
@@ -1468,7 +1532,9 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
 class Type2PlanND(_PointsND):
     """c[j] = sum_k f[k] exp(i*isign * k . x_j), modeord=0 box, dims 1-3."""
 
-    def __init__(self, x, n_modes, eps=1e-6, isign=-1, upsampfac=2.0,
+    _NUFFT_TYPE = 2
+
+    def __init__(self, x, n_modes, eps=1e-6, isign=-1, upsampfac=None,
                  prec="crit64", sort_points=False, spread_method="auto",
                  points_backend="auto"):
         super().__init__(x, n_modes, eps, isign, upsampfac, prec, sort_points,
