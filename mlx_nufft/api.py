@@ -32,6 +32,7 @@ Differences (documented, not silent):
 import warnings
 
 import numpy as np
+import mlx.core as mx
 
 from .nd import Type1PlanND, Type2PlanND
 from .gpu_t3 import GpuT3Plan
@@ -135,6 +136,34 @@ def _modes_tuple(n_modes, dim, out, out_offset=0):
     return tuple(int(n) for n in n_modes)
 
 
+def _t1_batch_chunk(plan, n_tr):
+    """Strength vectors per Type1PlanND.execute_batch call. The batched
+    spread grid and its FFT intermediates grow with the chunk, so the stacked
+    fine grid is held to a fraction of the GPU's recommended working set (the
+    per-vector loop never holds more than one grid). 1 means batching buys
+    nothing and the caller loops."""
+    ws = int(mx.device_info().get("max_recommended_working_set_size", 0))
+    if ws <= 0:
+        return n_tr
+    grid_bytes = 8 * int(np.prod(plan.n_up))
+    return max(1, min(n_tr, (ws // 8) // grid_bytes))
+
+
+def _execute_stack(plan, dv):
+    """Transform the (n_tr, ...) vector stack dv through plan -> (n_tr, ...).
+    A Type1PlanND batches: each execute_batch call shares one spread launch
+    across its chunk of vectors and runs whole-chunk per-axis FFTs. Type 2/3
+    plans, n_tr == 1 and a memory chunk of 1 run one execute per vector."""
+    n_tr = int(dv.shape[0])
+    if n_tr > 1 and isinstance(plan, Type1PlanND):
+        bc = _t1_batch_chunk(plan, n_tr)
+        if bc > 1:
+            parts = [plan.execute_batch(dv[b:b + bc])
+                     for b in range(0, n_tr, bc)]
+            return parts[0] if len(parts) == 1 else np.concatenate(parts)
+    return np.stack([plan.execute(dv[k]) for k in range(n_tr)])
+
+
 # ---------------------------------------------------------------------------
 # type 1: nonuniform -> uniform
 
@@ -158,7 +187,7 @@ def _nufft_t1(dim, coords, c, n_modes, out, eps, isign, kwargs):
     N = _modes_tuple(n_modes, dim, out)
     kw = {} if upsampfac is None else {"upsampfac": upsampfac}
     plan = Type1PlanND(coords, N, eps=eps, isign=isign, prec=prec, **kw)
-    res = np.stack([plan.execute(cv[t]) for t in range(n_tr)])
+    res = _execute_stack(plan, cv)
     if n_tr == 1 and (np.asarray(c).ndim == 1):
         res = res[0]
     return _fill_out(out, res, dtype)
@@ -264,7 +293,9 @@ class Plan:
     For types 1/2, n_modes_or_dim is the mode tuple (dim inferred from its
     length). For type 3 it is the dimension (1, 2 or 3). setpts() builds the
     GPU plan (points are part of plan state, as in cu/FINUFFT); execute()
-    runs each of n_trans vectors through the cached plan.
+    runs the n_trans vectors through the cached plan: type 1 (and the type-2
+    adjoint) batches them through one shared spread and whole-batch FFTs
+    (Type1PlanND.execute_batch), types 2/3 run one vector at a time.
     """
 
     def __init__(self, nufft_type, n_modes_or_dim, n_trans=1, eps=1e-6,
@@ -339,7 +370,7 @@ class Plan:
         if n_tr != self.n_trans:
             raise ValueError(f"data has {n_tr} vectors, plan has "
                              f"n_trans={self.n_trans}")
-        res = np.stack([self._plan.execute(dv[k]) for k in range(self.n_trans)])
+        res = _execute_stack(self._plan, dv)
         if self.n_trans == 1 and np.asarray(data).ndim == inner:
             res = res[0]
         return _fill_out(out, res, self.dtype)
@@ -381,8 +412,7 @@ class Plan:
         if n_tr != self.n_trans:
             raise ValueError(f"data has {n_tr} vectors, plan has "
                              f"n_trans={self.n_trans}")
-        res = np.stack([self._adjoint.execute(dv[k])
-                        for k in range(self.n_trans)])
+        res = _execute_stack(self._adjoint, dv)
         if self.n_trans == 1 and np.asarray(data).ndim == inner:
             res = res[0]
         return _fill_out(out, res, self.dtype)
