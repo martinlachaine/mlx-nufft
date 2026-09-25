@@ -151,11 +151,16 @@ def _t1_batch_chunk(plan, n_tr):
 
 def _execute_stack(plan, dv):
     """Transform the (n_tr, ...) vector stack dv through plan -> (n_tr, ...).
-    A Type1PlanND batches: each execute_batch call shares one spread launch
-    across its chunk of vectors and runs whole-chunk per-axis FFTs. Type 2/3
-    plans, n_tr == 1 and a memory chunk of 1 run one execute per vector."""
+    A GM-path Type1PlanND batches: each execute_batch call shares one spread
+    launch across its chunk of vectors and runs whole-chunk per-axis FFTs.
+    OD-path plans keep the per-vector loop: execute_batch would spread them
+    through the GM atomic kernel, which measured 0.26x to 0.71x of B looped OD
+    executes at high density on an M5 Max. Type 2/3 plans, n_tr == 1 and a
+    memory chunk of 1 also run one execute per vector."""
     n_tr = int(dv.shape[0])
-    if n_tr > 1 and isinstance(plan, Type1PlanND):
+    gm_path = isinstance(plan, Type1PlanND) and not (
+        getattr(plan, "_od", False) or getattr(plan, "_od_ex", False))
+    if n_tr > 1 and gm_path:
         bc = _t1_batch_chunk(plan, n_tr)
         if bc > 1:
             parts = [plan.execute_batch(dv[b:b + bc])
