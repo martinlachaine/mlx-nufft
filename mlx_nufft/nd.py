@@ -21,15 +21,36 @@ exactly (same kernels modulo generation); types12.py remains untouched as
 the validated reference implementation.
 """
 
+import os
+
 import numpy as np
 import mlx.core as mx
 
 from .sizing import kernel_params, kernel_ft_fast, next235even
-from .gpu_t3 import _es_msl, fft_axis, _DF64_HDR
+from .gpu_t3 import _es_msl, fft_axis, _DF64_HDR, _MK_MAX_ELEMS
 
 PI = np.pi
 
 _AX = ("x", "y", "z")
+
+# ---- type-2 pad path switch (perf A/B; correctness in
+# harness/test_pad_crop_paths.py). Read at call time, so it can be flipped
+# on the module between runs; the environment variable sets the
+# process-wide default (for profile_stages.py A/B runs without editing
+# source).
+#   "fused"  (default) every progressive pad of Type2PlanND._modes_to_grid
+#            is ONE tiled pass (_pad_kernel): the axis's in-band rows go
+#            through a 32x32 threadgroup tile, unit-stride on both sides,
+#            and the same threads write the zero pad; the axis-0 pass also
+#            carries the deconvolution. Traffic 1 + N/nu output sizes per
+#            pad, no temporary.
+#   "v020"   the 0.2.0 sequence: the per-thread axis-0 kernel (consecutive
+#            threads read modes N[1:]-apart), then per later axis mx.zeros
+#            + mx.concatenate of two transposed slices, which materializes
+#            the zero block (a 1 - N/nu temporary) and reads it back: four
+#            kernels and 2 + (1 - N/nu) output sizes of traffic per pad.
+# Dim 1 has no axis cycle, and both paths run the direct axis-0 kernel.
+PAD_PATH = os.environ.get("MLX_NUFFT_PAD_PATH", "fused")
 
 
 def _linearize(idx_names, dims):
@@ -38,6 +59,82 @@ def _linearize(idx_names, dims):
     for name, n in zip(idx_names[1:], dims[1:]):
         expr = f"({expr} * {n} + (size_t){name})"
     return expr
+
+
+# ---- tiled zero-pad kernel (the "fused" pads of the type-2 chain) --------
+_pad_kernels = {}
+
+
+def _pad_kernel(N, nu, R, rdims=None):
+    """Tiled zero-pad kernel for one axis of the type-2 chain: the row-
+    contiguous complex64 block X of N modeord rows by R columns (padded
+    axis leading) -> the (R, nu) row-major out with that axis cycled last
+    in FFT order, out[r, f] = X[m(f), r] on the N in-band rows (k = f for
+    f < N - N//2, k = f - nu for f >= nu - N//2, m = k + N//2) and 0 on the
+    nu - N pad rows, in one pass. The 32x32 threadgroup-tile scheme of
+    gpu_t3._perm_kernel over (r, f): loads unit-stride along r in X, stores
+    unit-stride along f in out, the pad rows written by the same store
+    threads (no zero temporary); _perm_kernel's affine index map cannot
+    express the band split, hence this sibling. With rdims (the axis-0
+    stage: r linearizes the modeord dims rdims = N[1:]) the deconvolution
+    rides along, the exact product dec1[m1] * dec2[m2] (* dec3[m3]) of the
+    per-thread kernel it replaces. Compile-time constants, cached.
+    grid=(ceil(R/32)*32, ceil(nu/32)*32, 1), threadgroup=(32, 32, 1).
+    """
+    key = (N, nu, R, rdims)
+    k = _pad_kernels.get(key)
+    if k is not None:
+        return k
+    hi = N - N // 2          # FFT-order rows [hi, lo) are the zero pad
+    lo = nu - N // 2         # first row of the negative-k block
+    dec = mul = ""
+    innames = ["X"]
+    if rdims is not None:
+        dim = len(rdims) + 1
+        innames += [f"dec{d + 1}" for d in range(dim)]
+        dec = f"\n            int m1 = q2 + {N // 2};"
+        rem = "r2"
+        for d in range(dim - 1, 0, -1):      # r2 = (m2 * N3 + m3) ...
+            if d > 1:
+                dec += f"\n            int m{d + 1} = {rem} % {rdims[d - 1]};"
+                rem = f"({rem} / {rdims[d - 1]})"
+            else:
+                dec += f"\n            int m2 = {rem};"
+        dec += ("\n            float d = "
+                + " * ".join(f"dec{d + 1}[m{d + 1}]" for d in range(dim))
+                + ";")
+        mul = " * d"
+    src = f"""
+    threadgroup float2 tile[32][33];
+    uint3 tg = threadgroup_position_in_grid;
+    uint3 tl = thread_position_in_threadgroup;
+    int r = (int)(tg.x * 32 + tl.x);
+    int f = (int)(tg.y * 32 + tl.y);
+    int q = f - {nu} * (f >= {lo});
+    if (r < {R} && f < {nu} && q < {hi}) {{
+        size_t ix = (size_t)(q + {N // 2}) * {R} + (size_t)r;
+        tile[tl.y][tl.x] = float2(X[ix].real, X[ix].imag);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int r2 = (int)(tg.x * 32 + tl.y);
+    int f2 = (int)(tg.y * 32 + tl.x);
+    if (r2 < {R} && f2 < {nu}) {{
+        int q2 = f2 - {nu} * (f2 >= {lo});
+        device float* Of = (device float*) out;
+        size_t io = (size_t)r2 * {nu} + (size_t)f2;
+        if (q2 < {hi}) {{
+            float2 v = tile[tl.x][tl.y];{dec}
+            Of[2*io] = v.x{mul}; Of[2*io+1] = v.y{mul};
+        }} else {{
+            Of[2*io] = 0.0f; Of[2*io+1] = 0.0f;
+        }}
+    }}
+"""
+    k = mx.fast.metal_kernel(
+        name=f"t2pad_{N}_{nu}_{R}" + ("_dec" if rdims is not None else ""),
+        input_names=innames, output_names=["out"], source=src)
+    _pad_kernels[key] = k
+    return k
 
 
 def _build_t1_df64_setup_kernel(dim):
@@ -1407,11 +1504,15 @@ class Type2PlanND(_PointsND):
             self._pending_gpu = None
             self._sort_and_upload_gpu(i1_g, fr_g)
 
-        # ---- axis-0 pad + deconvolve (fused) -----------------------------
+        # ---- axis-0 pad + deconvolve (fused, per thread) -----------------
         # _modes_to_grid FFTs axis 0 first, on a grid still cropped in every
         # other axis: this kernel scatters the deconvolved modes into the
         # axis-0 FFT-order rows (zeros out of band), with axis 0 cycled to
         # the contiguous last position -> output (N[1], .., N[dim-1], nu[0]).
+        # Consecutive r1 threads read modes N[1:]-apart (scattered loads):
+        # it is the PAD_PATH "v020" axis-0 stage and the dim-1 stage of both
+        # paths (no cycle there); dims 2/3 on "fused" run the tiled
+        # _pad_kernel instead (_pad_axis).
         if dim == 3:
             src = f"""
     uint r1 = thread_position_in_grid.x;
@@ -1665,42 +1766,67 @@ class Type2PlanND(_PointsND):
             output_names=["out"], header="#include <metal_math>\n" + es,
             source=src)
 
+    def _pad_axis(self, H, d):
+        """One progressive-pad stage of _modes_to_grid (lazy): zero-pad the
+        chain's axis d, the leading axis of H (N[d] modeord rows), to nu[d]
+        in FFT order and cycle it to the contiguous last position, giving
+        (*H.shape[1:], nu[d]) complex64. d = 0 takes the flat float32 mode
+        box and folds in the deconvolution. PAD_PATH picks the kernel (see
+        the module switch); "fused" also falls back to the 0.2.0 sequence
+        past the metal_kernel element cap."""
+        dim, N, nu = self.dim, self.N, self.n_up
+        if PAD_PATH not in ("fused", "v020"):
+            raise ValueError(f"PAD_PATH {PAD_PATH!r}: expected 'fused' or "
+                             "'v020'")
+        lead = tuple(N[1:]) if d == 0 else tuple(H.shape[1:])
+        R = int(np.prod(lead)) if lead else 1
+        if PAD_PATH == "fused" and dim > 1 and R * nu[d] <= _MK_MAX_ELEMS:
+            ins = ([mx.view(H, dtype=mx.complex64)] + self.mx_dec if d == 0
+                   else [H])
+            out = _pad_kernel(N[d], nu[d], R, lead if d == 0 else None)(
+                inputs=ins,
+                output_shapes=[(R * nu[d],)], output_dtypes=[mx.complex64],
+                grid=(-(-R // 32) * 32, -(-nu[d] // 32) * 32, 1),
+                threadgroup=(32, 32, 1))[0]
+            return out.reshape(*lead, nu[d])
+        if d == 0:
+            if dim == 3:
+                g = (nu[0], N[2], N[1])
+            elif dim == 2:
+                g = (nu[0], N[1], 1)
+            else:
+                g = (nu[0], 1, 1)
+            Hf = self._pad(
+                inputs=[H] + self.mx_dec,
+                output_shapes=[(R * nu[0] * 2,)],
+                output_dtypes=[mx.float32],
+                grid=g, threadgroup=self._tg_for(g[0]))[0]
+            return mx.view(Hf, dtype=mx.complex64).reshape(*lead, nu[0])
+        T = mx.transpose(H, tuple(range(1, dim)) + (0,))   # axis d -> last
+        parts = [T[..., N[d] // 2:]]          # k = 0 .. N-N//2-1
+        if nu[d] > N[d]:
+            zshape = tuple(T.shape[:-1]) + (nu[d] - N[d],)
+            parts.append(mx.zeros(zshape, dtype=mx.complex64))
+        if N[d] // 2 > 0:
+            parts.append(T[..., :N[d] // 2])       # k = -N//2 .. -1
+        return mx.concatenate(parts, axis=dim - 1)
+
     def _modes_to_grid(self, fkf):
         """Progressive pad+FFT (mirror of Type1PlanND._fft_modes): flat
         float32 view of the modeord box -> FFT'd fine grid (*n_up, natural
         axis order, evaluated).
 
-        Each axis is zero-padded to nu_d immediately BEFORE its FFT, so
-        early FFTs run on the still-cropped box. The axis-0 pad and the
-        deconvolution ride one kernel (_pad); later pads are slice+
-        concatenate writes that also cycle the padded axis to the contiguous
-        last position, so every FFT is contiguous-last-axis."""
-        dim, N, nu = self.dim, self.N, self.n_up
+        Each axis is zero-padded to nu_d immediately BEFORE its FFT
+        (_pad_axis), so early FFTs run on the still-cropped box; every pad
+        also cycles the padded axis to the contiguous last position, so
+        every FFT is contiguous-last-axis. The axis-0 pad carries the
+        deconvolution."""
+        dim = self.dim
         inv = self.isign > 0
-        d0 = tuple(N[d] for d in range(1, dim)) + (nu[0],)
-        if dim == 3:
-            g = (nu[0], N[2], N[1])
-        elif dim == 2:
-            g = (nu[0], N[1], 1)
-        else:
-            g = (nu[0], 1, 1)
-        Hf = self._pad(
-            inputs=[fkf] + self.mx_dec,
-            output_shapes=[(int(np.prod(d0)) * 2,)],
-            output_dtypes=[mx.float32],
-            grid=g, threadgroup=self._tg_for(g[0]))[0]
-        H = mx.view(Hf, dtype=mx.complex64).reshape(*d0)
+        H = self._pad_axis(fkf, 0)
         H = fft_axis(H, dim - 1, inverse=inv, twiddle_cache=self._twiddles)
-        cyc = tuple(range(1, dim)) + (0,)
         for d in range(1, dim):
-            T = mx.transpose(H, cyc)          # axis d -> contiguous last
-            parts = [T[..., N[d] // 2:]]      # k = 0 .. N-N//2-1
-            if nu[d] > N[d]:
-                zshape = tuple(T.shape[:-1]) + (nu[d] - N[d],)
-                parts.append(mx.zeros(zshape, dtype=mx.complex64))
-            if N[d] // 2 > 0:
-                parts.append(T[..., :N[d] // 2])   # k = -N//2 .. -1
-            H = mx.concatenate(parts, axis=dim - 1)
+            H = self._pad_axis(H, d)
             H = fft_axis(H, dim - 1, inverse=inv,
                          twiddle_cache=self._twiddles)
         mx.eval(H)
