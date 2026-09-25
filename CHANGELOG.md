@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.3.0 - 2026-09-25
+
+Note: the benchmarks in the technical report (`mlx-nufft.pdf`) describe v0.1; a revised report is in preparation.
+
+This release is about correctness at tight tolerances, faster type-2 and type-3 execution, and much faster plan construction. The numbers below come from the per-stage profiler in `harness/profile_stages.py` (median of 7 runs on an M5 Max) against the committed v0.2.0 baseline. The public API is unchanged, and every new default keeps the previous path selectable.
+
+**Accuracy**
+- Type 3 at eps at or below 1e-5 now delivers what single-precision FINUFFT delivers. The type-3 path runs the kernel at upsampling factor 1.25, where fp32 grid error is amplified by the deconvolution. v0.2.0 used kernel widths of 9 and 10 there and could land at 1e-4 to 3e-4 on isotropic 3D problems. The width is now capped at 8 when three axes carry a full band, FINUFFT's own fp32 rule, and at 10 otherwise, so thin slabs keep their better widths. Isotropic 3D type 3 at eps=1e-6 improves from 3.3e-4 to 5.3e-5; the anisotropic slab case stays in its 1.4e-5 class.
+- Documented floor: with upsampling factor 1.25 in fp32 the achievable error is about 5e-5 for eps at or below 1e-5, and at eps=1e-4 these paths sit 1.5 to 2.6 times above FINUFFT's fp32 result. Upsampling factor 2 is unaffected (1.2e-5 at eps=1e-5, 1.5e-6 at 1e-6).
+
+**Faster execution**
+- Types 1 and 2 in 3D default to upsampling factor 1.25 on grids of at least 32768 modes when eps is 1e-4 or looser (type 2) or 1e-3 or looser (type 1, and 1e-4 on grids of 2^24 modes or more). At eps=1e-3, 128^3 and 256^3 run 2.0 to 2.2x faster for type 1 (20.5 to 10.3 ms at 256^3) and 1.8 to 2.1x for type 2 (17.5 to 8.4 ms); the achieved error at those eps is 1.5 to 1.6 times the sigma-2 result, in the same eps bracket. Pass `upsampfac=2.0` to keep the previous behavior; `MLX_NUFFT_UPSAMPFAC` overrides the default for comparisons.
+- Type 2: the zero-pad before each axis FFT is one tiled kernel instead of four, with no zero temporary (1.5 grid passes instead of 2.5). 3D 256^3: 21.0 to 17.6 ms (1.19x); 128^3: 1.14 to 1.16x.
+- Type 3: the FFT chain keeps every FFT on a contiguous axis, with tiled transposes on full 3D grids (MLX's FFT on a non-last axis was copying the grid twice), a dense DFT kernel for axes of 32 cells or fewer, and the four-step twiddle fused into its transpose. 3D generic: 65.0 to 60.4 ms (1.08x) at eps=1e-3 and 70.0 to 63.2 ms (1.11x) at 1e-5; 1D: 23.3 to 20.2 ms (1.15x) at 1e-5.
+- The public `Plan` batches `n_trans` vectors through one spread and whole-batch FFTs for type-1 plans on the global-memory spread path (2.7x on small plans). Plans on the tile path keep the per-vector loop, which measured faster there.
+
+**Faster plan construction**
+- Type-1 and type-2 plans evaluate the deconvolution through the certified Chebyshev proxy already used by type 3, with the quadrature as fallback. A 1D plan over 2^20 modes builds in 0.023 s instead of 0.39 s.
+
+**Tried and not adopted**
+- Piecewise-polynomial (Horner) kernel evaluation, the main cuFINUFFT spreading lever, is neutral on Apple GPUs (0.94 to 1.01x): exp2 is cheap and the spread is bound by atomics and memory traffic. Kept on a branch.
+- Staging the global-memory spread's weights once per point gave identical times. FINUFFT 2.5's re-tuned beta for upsampling factor 1.25 was worse on 23 of 28 measured cases for this kernel.
+
+**New**
+- `harness/profile_stages.py`, a per-stage profiler with committed baseline tables, plus accuracy studies for the width cap and the upsampling policy. Module-level switches with environment overrides (`MLX_NUFFT_FFT_STRATEGY`, `MLX_NUFFT_PAD_PATH`, `MLX_NUFFT_UPSAMPFAC`) select the previous paths for comparison.
+- The optional VkFFT backend measures 1.2x on the 3D type-3 case on top of this release. Making it the default with a prebuilt bridge is planned for v0.4, together with device-resident inputs and outputs.
+
 ## v0.2.0 - 2026-07-02
 
 Note: the benchmarks in the technical report (`mlx-nufft.pdf`) describe v0.1 and predate the speedups in this release.
