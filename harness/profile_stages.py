@@ -52,6 +52,7 @@ import mlx.core as mx
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import mlx_nufft                                             # noqa: E402
+import mlx_nufft.nd as nd                                    # noqa: E402
 from mlx_nufft.nd import Type1PlanND, Type2PlanND            # noqa: E402
 from mlx_nufft.gpu_t3 import (GpuT3Plan, fft_axis,           # noqa: E402
                               fft_grid_stages)
@@ -140,38 +141,19 @@ def t1_stages(plan, c):
 
 
 def t2_stages(plan, fk):
-    """Type2PlanND.execute + _modes_to_grid, one yield per kernel / FFT."""
-    dim, N, nu = plan.dim, plan.N, plan.n_up
+    """Type2PlanND.execute + _modes_to_grid, one yield per kernel / FFT
+    (the pad stages run plan._pad_axis, so they follow nd.PAD_PATH)."""
+    dim = plan.dim
     inv = plan.isign > 0
     fmx = mx.array(np.asarray(fk, dtype=np.complex64))
     yield "h2d", fmx
     fkf = mx.view(fmx.reshape(-1), dtype=mx.float32)
-    d0 = tuple(N[d] for d in range(1, dim)) + (nu[0],)
-    if dim == 3:
-        g = (nu[0], N[2], N[1])
-    elif dim == 2:
-        g = (nu[0], N[1], 1)
-    else:
-        g = (nu[0], 1, 1)
-    Hf = plan._pad(
-        inputs=[fkf] + plan.mx_dec,
-        output_shapes=[(int(np.prod(d0)) * 2,)],
-        output_dtypes=[mx.float32],
-        grid=g, threadgroup=plan._tg_for(g[0]))[0]
-    H = mx.view(Hf, dtype=mx.complex64).reshape(*d0)
+    H = plan._pad_axis(fkf, 0)
     yield "pad_x+deconv", H
     H = fft_axis(H, dim - 1, inverse=inv, twiddle_cache=plan._twiddles)
     yield "fft_x", H
-    cyc = tuple(range(1, dim)) + (0,)
     for d in range(1, dim):
-        T = mx.transpose(H, cyc)
-        parts = [T[..., N[d] // 2:]]
-        if nu[d] > N[d]:
-            zshape = tuple(T.shape[:-1]) + (nu[d] - N[d],)
-            parts.append(mx.zeros(zshape, dtype=mx.complex64))
-        if N[d] // 2 > 0:
-            parts.append(T[..., :N[d] // 2])
-        H = mx.concatenate(parts, axis=dim - 1)
+        H = plan._pad_axis(H, d)
         yield f"pad_{AX[d]}", H
         H = fft_axis(H, dim - 1, inverse=inv, twiddle_cache=plan._twiddles)
         yield f"fft_{AX[d]}", H
@@ -499,6 +481,7 @@ def to_markdown(doc):
            f"- git {m['git']['sha'][:12]} ({m['git']['branch']}"
            f"{', dirty' if m['git']['dirty'] else ''})",
            f"- run: {m['timestamp']}",
+           f"- type-2 pad path: {m.get('pad_path', 'v020')} (nd.PAD_PATH)",
            f"- protocol: per measurement, the GPU is kept busy for "
            f"{m['wake_ms']:.0f} ms (matmul loop) so the clocks are at steady "
            f"state, then {m['warm']} warm-up executes, then {m['reps']} "
@@ -638,11 +621,13 @@ def main(argv):
                 timestamp=datetime.now(timezone.utc).isoformat(
                     timespec="seconds"),
                 reps=reps, warm=warm, wake_ms=wake_ms, seed=SEED,
-                eps=list(EPS_LIST), sync_floor_s=sync_floor())
+                eps=list(EPS_LIST), sync_floor_s=sync_floor(),
+                pad_path=nd.PAD_PATH)
     print(f"machine: {meta['machine']}\nmlx {meta['mlx_version']}  "
           f"mlx_nufft {meta['mlx_nufft_version']}  git {meta['git']['sha'][:12]}"
           f"  reps={reps} warm={warm}  sync floor "
-          f"{meta['sync_floor_s'] * 1e3:.3f} ms", flush=True)
+          f"{meta['sync_floor_s'] * 1e3:.3f} ms  pad path {meta['pad_path']}",
+          flush=True)
 
     rows = []
     t_start = time.perf_counter()
