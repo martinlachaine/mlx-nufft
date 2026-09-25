@@ -72,7 +72,16 @@ _SLAB_THRESHOLD = 3e9
 #               every layout pass is coalesced on both sides and the output
 #               is natural (no deferred copy). Four-step T1/T3 use the same
 #               kernel.
-FFT_STRATEGY = os.environ.get("MLX_NUFFT_FFT_STRATEGY", "strided")
+#   "auto"      (default) "transpose" when every axis of the grid is longer
+#               than _SMALL_AXIS_DFT, else "strided" with the dense DFT on
+#               the short axes. Measured whole-execute medians (M5 Max):
+#               transpose takes t3 3D 640^3 from 65.0 to 60.8 ms (eps 1e-3)
+#               and 70.0 to 64.8 ms (1e-5), but is 1 to 2 percent behind
+#               strided + dense on the 90000x16x16 / 24x24 1D embedding,
+#               where dense + fused twiddle alone give 15.7 -> 14.4 and
+#               23.0 -> 19.8 ms; the 2^21 four-step of 1D types 1/2 is
+#               within noise either way.
+FFT_STRATEGY = os.environ.get("MLX_NUFFT_FFT_STRATEGY", "auto")
 # Axes of length <= _SMALL_AXIS_DFT (0 disables) use a dense DFT kernel (one
 # thread per column against an n x n complex64 table) instead of an FFT
 # launch: one in-place pass that keeps the natural layout whatever the axis
@@ -150,6 +159,19 @@ def _split_native(n):
     if _is_native(n):
         return (n, 1)
     return _split_n(n)
+
+
+def _strategy(shape):
+    """FFT_STRATEGY resolved for a grid of the given shape (see the switch
+    comments): "auto" is "transpose" when every axis is longer than
+    _SMALL_AXIS_DFT and "strided" otherwise."""
+    if FFT_STRATEGY == "auto":
+        return ("transpose" if all(n > _SMALL_AXIS_DFT for n in shape)
+                else "strided")
+    if FFT_STRATEGY not in ("strided", "transpose"):
+        raise ValueError(f"FFT_STRATEGY {FFT_STRATEGY!r}: expected 'auto', "
+                         "'strided' or 'transpose'")
+    return FFT_STRATEGY
 
 
 def _twiddle_table(n, inverse, cache):
@@ -243,9 +265,10 @@ def _perm_kernel(shape, in_strides, t_strides):
 
 
 def _tiled_permute(X, shape, in_strides, T=None, t_strides=None):
-    """Row-major complex64 array out[i] = X[i . in_strides] (* T[i . t_strides])
-    of the given shape: one layout pass over the row-contiguous X (read flat)
-    through _perm_kernel. Size-1 dims are dropped before tiling. Falls back
+    """Row-major complex64 array out[i] = X[i . in_strides] (times
+    T[i . t_strides]) of the given shape: one layout pass over the
+    row-contiguous X (read flat) through _perm_kernel. Size-1 dims are
+    dropped before tiling. Falls back
     to an mx strided view + contiguous copy when the unit-stride dim is
     already last or the array exceeds the metal_kernel int32 element cap."""
     keep = [d for d, s in enumerate(shape) if s != 1]
@@ -376,7 +399,7 @@ def _four_step(H, axis, inverse, twiddle_cache, scrambled):
     lead = shp[:axis]
     rest = shp[axis + 1:]
     L, R = int(np.prod(lead)), int(np.prod(rest))
-    tiled = FFT_STRATEGY == "transpose"
+    tiled = _strategy(shp) == "transpose"
     # T1: (L, n1, n2, R) -> (L, n2, R, n1), k1 unit-stride
     if tiled:
         Y = _tiled_permute(H, (L, n2, R, n1), (n1 * n2 * R, R, 1, n2 * R))
@@ -484,7 +507,8 @@ def fft_grid_stages(H, inverse, twiddle_cache=None, eager=False):
 
     FFT_STRATEGY "strided": fft_axis per axis, the v0.2.0 chain (MLX handles
     a non-last axis with an internal strided copy and leaves the result in
-    that permuted layout; the consumer's view pays the copy back).
+    that permuted layout; the consumer's view pays the copy back). "auto"
+    picks per grid shape (_strategy).
     "transpose": every library FFT runs on the last axis. A short axis (see
     _SMALL_AXIS_DFT) is transformed in place by the dense DFT and a long one
     by the four-step at its current position (both keep the layout); any
@@ -495,7 +519,7 @@ def fft_grid_stages(H, inverse, twiddle_cache=None, eager=False):
     one-sided-scattered internal copies and the consumer's copy back.
     """
     d = H.ndim
-    if FFT_STRATEGY != "transpose":
+    if _strategy(H.shape) != "transpose":
         for ax in range(d - 1, -1, -1):
             H = fft_axis(H, ax, inverse, twiddle_cache)
             yield ax, H

@@ -8,9 +8,10 @@ Covered: fft_axis on native (640, 486, 4096), pow2 (2^17, 2^20 native to MLX,
 (16, 18, 24) lengths, each as a batched last axis, a middle axis with trailing
 dims and a leading axis, both signs; fft_axis_scrambled on the four-step
 lengths; fft_grid_stages (the type-3 3D chain) on grids mixing the cases; and
-end-to-end plans (type-3 3D, type-3 1D-embedded with the 90000 four-step,
-type-1/2 1D with the 2^21 four-step) versus their references and across the
-switch settings.
+the FFT_STRATEGY "auto" resolution on a full-3D and a degenerate-axis grid;
+and end-to-end plans (type-3 3D, type-3 1D-embedded with the 90000
+four-step, type-1/2 1D with the 2^21 four-step) versus their references and
+across the switch settings.
 
 Gates: rel L2 <= 1e-6 against the fp64 FFT reference and against the v0.2.0
 path for every helper-level case (fp32 FFTs land at 3e-7 to 5e-7); at plan
@@ -40,6 +41,7 @@ TOL_PLAN = 5e-6       # plan outputs across settings
 #  _SMALL_AXIS_DFT_LAST); "v020" is the 0.2.0 path
 CONFIGS = [
     ("v020", "strided", False, 0, False),
+    ("auto", "auto", True, 32, False),
     ("fused", "strided", True, 0, False),
     ("transpose", "transpose", True, 0, False),
     ("dft", "strided", True, 32, False),
@@ -138,6 +140,40 @@ def check_chain_case(fails, rng, shape):
         report(fails, label, e_ref[wr], e_old[wo], wr, wo, TOL_REF, TOL_OLD)
 
 
+def check_auto(fails, rng, shape):
+    """FFT_STRATEGY "auto" (the default) must resolve to "transpose" when
+    every axis is longer than _SMALL_AXIS_DFT and to "strided" otherwise,
+    and the chain it runs must reproduce the explicit strategy's output."""
+    restore()
+    expect = "transpose" if all(n > g._SMALL_AXIS_DFT for n in shape) \
+        else "strided"
+    got = g._strategy(shape)
+    g._SMALL_AXIS_DFT = 0          # nothing is short: every grid tiles
+    got0 = g._strategy(shape)
+    restore()
+    x = cplx(rng, shape)
+    xm = mx.array(x)
+    worst = 0.0
+    for inverse in (False, True):
+        outs = {}
+        for strat in ("auto", expect):
+            g.FFT_STRATEGY = strat
+            h = None
+            for _ax, h in fft_grid_stages(xm, inverse, {}, eager=True):
+                pass
+            outs[strat] = np.array(h)
+        restore()
+        worst = max(worst, rel_l2(outs["auto"], outs[expect]))
+    ok = (DEFAULTS[0] == "auto" and got == expect and got0 == "transpose"
+          and worst <= TOL_OLD)
+    if not ok:
+        fails.append(f"auto {shape}: default={DEFAULTS[0]} got={got} "
+                     f"expect={expect} dft0={got0} diff={worst:.2e}")
+    print(f"  {'PASS' if ok else 'FAIL'} auto {shape} -> {got} "
+          f"(expected {expect}; {got0} at _SMALL_AXIS_DFT=0)  "
+          f"vs explicit {worst:.1e}")
+
+
 def check_plan(fails, label, run, ref):
     """Plan outputs under every config against the reference and against
     the v0.2.0 path. The atomic spreads make execute() nondeterministic
@@ -189,6 +225,10 @@ def main():
     for shape in [(40, 36, 48), (640, 40, 36), (486, 24, 18), (64, 16, 40),
                   (5400, 24, 24), (90000, 16, 16)]:
         check_chain_case(fails, rng, shape)
+
+    print("== FFT_STRATEGY auto resolution ==")
+    check_auto(fails, rng, (640, 40, 36))       # full 3D: transpose
+    check_auto(fails, rng, (90000, 16, 16))     # 1D embedding: strided
 
     print("== plans across settings ==")
     # type-3 3D, native axes: direct-sum reference
