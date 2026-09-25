@@ -5,4 +5,4 @@ contact_links:
     about: See the README usage section and examples/quickstart.py before opening an issue.
   - name: Technical report and version context
     url: https://github.com/martinlachaine/mlx-nufft/blob/main/REPORT.md
-    about: Read the v0.1 technical report and how it relates to the current implementation.
+    about: The v0.1 technical report and how it relates to the current release.

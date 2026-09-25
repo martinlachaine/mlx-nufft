@@ -15,12 +15,11 @@ precision-critical coordinate setup performed in double precision at plan time
 ("crit64"), so it reaches fp64-grade accuracy on hardware that has no native
 double precision.
 
-> **Technical report (v0.1):** [`mlx-nufft.pdf`](mlx-nufft.pdf), describing
-> the method, accuracy, and performance (types 1/2/3 in 1/2/3D, the
-> crit64 precision mechanism, and M1 / M5 Max benchmarks).
-> The report describes the original implementation and benchmarks; v0.2
-> changes plan setup and execution. See [report status](REPORT.md) for context
-> and the [changelog](CHANGELOG.md#v020---2026-07-02) for v0.2 results.
+> **Technical report (v0.1):** [`mlx-nufft.pdf`](mlx-nufft.pdf) describes the
+> method, the crit64 precision mechanism, and the M1 / M5 Max benchmarks of the
+> original implementation. Its performance figures predate the v0.2 and v0.3
+> speedups; see [REPORT.md](REPORT.md) and the [changelog](CHANGELOG.md) for
+> current numbers. A revised report is in preparation.
 > Pin a tagged release rather than tracking `main`.
 
 ## Install
@@ -34,7 +33,7 @@ pip install mlx-nufft
 Or pin a tagged release straight from GitHub:
 
 ```bash
-pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.2.0"
+pip install "git+https://github.com/martinlachaine/mlx-nufft.git@v0.3.0"
 ```
 
 then `import mlx_nufft`. Dependencies are pinned (notably `mlx==0.31.2`).
@@ -160,7 +159,7 @@ the bridge is built.
   oracle.
 - `vkfft_bridge/`: optional VkFFT-Metal backend build.
 
-## Development and validation
+## Validation
 
 The test suite checks numerical results against CPU FINUFFT and exact
 direct-summation oracles on small problems. It also checks transform conventions,

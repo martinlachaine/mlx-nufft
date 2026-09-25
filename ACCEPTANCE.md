@@ -1,11 +1,9 @@
-# Acceptance / benchmarks
+# Acceptance and benchmarks
 
-Accuracy, speed, and memory results for v0.1 — measured on two Apple-silicon
-machines (an M1 and an M5 Max) — are reported in the
-[technical report](mlx-nufft.pdf). These measurements predate the v0.2 changes
-to plan setup and execution. See [report status](REPORT.md) and the
-[v0.2.0 changelog](CHANGELOG.md#v020---2026-07-02) for context and reported
-performance improvements.
+The technical report's accuracy, speed, and memory results are v0.1
+measurements on an M1 and an M5 Max; see [REPORT.md](REPORT.md). Current
+per-stage timings against the committed baselines come from
+`harness/profile_stages.py` (tables in `harness/PROFILE_*.md`).
 
 To generate the acceptance matrix for your checkout and hardware:
 
