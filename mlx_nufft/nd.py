@@ -122,7 +122,7 @@ class _PointsND:
         self.isign = +1 if isign >= 0 else -1   # finufft: non-negative -> +
         self.eps = eps
         self.sigma = upsampfac
-        self.w, self.beta = kernel_params(eps, upsampfac)
+        self.w, self.beta = kernel_params(eps, upsampfac, self.dim)
         w = self.w
         self.n_up = [next235even(max(2 * w, int(np.ceil(upsampfac * n))))
                      for n in self.N]

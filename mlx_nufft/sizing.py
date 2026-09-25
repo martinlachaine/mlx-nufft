@@ -5,9 +5,39 @@ All formulas are ports of FINUFFT's setup_spreader() / set_nhg_type3()
 shapes match the CPU oracle's algorithm family.
 """
 
+import logging
+
 import numpy as np
 
 PI = np.pi
+_log = logging.getLogger(__name__)
+
+# FINUFFT setup_spreadinterp's single-precision guard ("ns reducing from N
+# to 8 to prevent r_{dyn}-related catastrophic cancellation"): the
+# deconvolution divides by the kernel FT, whose dynamic range across the
+# band, r_dyn = phihat(0)/phihat(pi/sigma), is 34 at w=8, 56 at w=9, 93 at
+# w=10 and 1863 at w=16 for sigma=1.25 (2 to 8 at every w for sigma=2), and
+# it multiplies the fp32 grid's rounding error. A target at a corner of
+# the band sees the product over the axes that reach the band edge, so
+# the width past which a wider kernel makes the result worse depends on
+# how many axes do. With three it is 8 (corner amplification 4.0e4 at
+# w=8, 1.8e5 at w=9, 8.0e5 at w=10: FINUFFT's rule; w=9/10 measured 2x to
+# 7x worse in 3D). With two or fewer it is 10, the width the API's eps
+# floor of 1e-6 implies: 2D 8.6e3 at w=10, a slab with a thin third axis
+# 2.4e4, a rod 7.2e2, all under the three-axis figure at w=8, and w=8
+# measured 2x worse than w=9/10 on 2D grids and the thin slab. The grid
+# here is always fp32, so the caps apply at every sigma < 2 (FINUFFT
+# applies its one at its one low sigma, 1.25); at sigma=1.25 they engage
+# below eps 1.3e-5 (three axes) and 7.9e-7 (otherwise).
+W_MAX_FP32_LOWSIGMA_3D = 8
+W_MAX_FP32_LOWSIGMA = 10
+# An axis is thin when its targets reach at most this fraction of the
+# kernel band [-pi/sigma, pi/sigma] in the deconvolution (band_fraction
+# below; the acceptance suite's slab has 0.26 on z, an embedded 1D/2D
+# transform 0). Up to 0.5 the per-axis amplification is at most 2.8 at
+# w=10 (2.5 at w=9) against 93 at the band edge, which is what keeps the
+# slab and rod figures above under the three-axis one.
+THIN_AXIS_BAND = 0.5
 
 
 def next235even(n: int) -> int:
@@ -25,18 +55,21 @@ def next235even(n: int) -> int:
         n += 2
 
 
-def kernel_params(eps: float, upsampfac: float):
+def kernel_params(eps: float, upsampfac: float, nfull=None):
     """Kernel width w and ES beta for tolerance eps at given upsampling factor.
 
     Port of FINUFFT setup_spreader(): for sigma=2, w = ceil(log10(10/eps));
-    otherwise w from the Liu lower-bound formula. beta = (beta/w)*w with the
-    FINUFFT-tuned ratios.
+    otherwise w from the Liu lower-bound formula, then capped for sigma < 2
+    by nfull, the number of axes that carry a full band (ND types 1/2: the
+    dimension; type 3: full_band_axes; None: unknown, takes the three-axis
+    cap). beta = (beta/w)*w with the FINUFFT-tuned ratios.
     """
     if upsampfac == 2.0:
         ns = int(np.ceil(-np.log10(eps / 10.0)))
     else:
         ns = int(np.ceil(-np.log(eps) / (PI * np.sqrt(1.0 - 1.0 / upsampfac))))
     ns = max(2, min(ns, 16))
+    ns = cap_kernel_width(ns, upsampfac, nfull)
     betaoverns = 2.30
     if ns == 2:
         betaoverns = 2.20
@@ -48,6 +81,38 @@ def kernel_params(eps: float, upsampfac: float):
         gamma = 0.97
         betaoverns = gamma * PI * (1.0 - 1.0 / (2.0 * upsampfac))
     return ns, betaoverns * ns
+
+
+def cap_kernel_width(ns, upsampfac, nfull=None):
+    """Apply the fp32 low-sigma cap for nfull full-band axes (None: the
+    three-axis cap) to a chosen width. A debug-level note, not a warning:
+    every 3D sigma=1.25 plan at eps <= 1e-5 takes it, and the API already
+    warns once about the fp32 envelope when it clamps eps."""
+    cap = W_MAX_FP32_LOWSIGMA_3D if nfull is None or nfull >= 3 \
+        else W_MAX_FP32_LOWSIGMA
+    if upsampfac < 2.0 and ns > cap:
+        _log.debug("kernel width %d reduced to %d at upsampfac=%g, %s "
+                   "full-band axes (fp32 r_dyn guard)", ns, cap, upsampfac,
+                   "unknown" if nfull is None else nfull)
+        ns = cap
+    return ns
+
+
+def band_fraction(S, X):
+    """Fraction of the kernel band [-pi/sigma, pi/sigma] that one axis's
+    targets reach in the type-3 deconvolution: S/Ssafe, with Ssafe the
+    half-extent set_nhg_type3 pads S to (1/X once S*X < 1, so the
+    argument pi*(s-D)/(sigma*Ssafe) stops at S*X of the band edge; 1 when
+    both vanish, as on the axes a 1D/2D transform embeds in 3D)."""
+    if X == 0.0:
+        return 0.0 if S == 0.0 else 1.0
+    return min(1.0, S * X)
+
+
+def full_band_axes(S, X):
+    """Number of axes whose targets reach past THIN_AXIS_BAND of the kernel
+    band: the effective dimension kernel_params caps the width for."""
+    return sum(band_fraction(s, x) > THIN_AXIS_BAND for s, x in zip(S, X))
 
 
 def es_kernel(d, beta, w):
