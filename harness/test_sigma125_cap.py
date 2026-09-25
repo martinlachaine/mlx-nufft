@@ -40,6 +40,7 @@ import pathlib
 import sys
 
 import numpy as np
+import mlx.core as mx
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[0].parent))
 from harness.gen import rel_l2                                     # noqa: E402
@@ -62,6 +63,16 @@ T1_NOISE_GATE = 1e-6        # (c): type-1 rel-L2 between runs (atomics noise)
 GATE_EPS = (1e-5, 1e-6)     # (b): eps values where the caps engage
 EXPECT_W = {1e-5: {3: 8, 2: 9, 1: 9}, 1e-6: {3: 8, 2: 10, 1: 10}}
 T3_NFULL = {"iso20": 3, "iso60": 3, "aniso": 2, "rod": 1}
+_GPU_CAP = int(mx.device_info().get("max_buffer_length", 0))
+
+
+def too_big_for_gpu(plan):
+    """The type-3 slab pipeline holds several copies of the padded grid;
+    the GitHub macOS runner (3.5 GiB Metal buffer cap) cannot execute the
+    256-mode anisotropic case. Width checks need only the plan."""
+    n_up = getattr(plan, "n_up", None)
+    return bool(_GPU_CAP) and n_up is not None and \
+        64 * int(np.prod(n_up)) > _GPU_CAP
 SIGMA2_CASES = [("2d", (40, 36), 3000, 1e-5, 1e-6),   # tag, N, M, eps1, eps2
                 ("3d", (20, 18, 16), 4000, 1e-6, 1e-5)]
 SIGMA2_SEED = 20260925
@@ -255,6 +266,11 @@ def check_accuracy():
             w = plan.w
             check(f"t3 {name} eps={eps:.0e}: w={EXPECT_W[eps][nfull]}",
                   w == EXPECT_W[eps][nfull], f"w={w}")
+            if too_big_for_gpu(plan):
+                print(f"  SKIP t3 {name} eps={eps:.0e} accuracy: grid "
+                      f"{tuple(int(n) for n in plan.n_up)} exceeds this GPU's "
+                      f"{_GPU_CAP / 2**30:.1f} GiB buffer cap")
+                continue
             em = t3_err(mlx_t3(prob, eps), prob, ref)
             ef = t3_err(fin32_t3(prob, eps), prob, ref)
             label = f"t3 {name} eps={eps:.0e} w={w}"

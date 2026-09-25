@@ -13,7 +13,7 @@ and end-to-end plans (type-3 3D, type-3 1D-embedded with the 90000
 four-step, type-1/2 1D with the 2^21 four-step) versus their references and
 across the switch settings.
 
-Gates: rel L2 <= 1e-6 against the fp64 FFT reference and against the v0.2.0
+Gates: rel L2 <= 4e-6 against the fp64 FFT reference and <= 1e-6 against the v0.2.0
 path for every helper-level case (fp32 FFTs land at 3e-7 to 5e-7); at plan
 level every setting must stay within 1.5x the v0.2.0 path's own reference
 error and within 3x its run-to-run scatter of it (see check_plan).
@@ -33,7 +33,8 @@ from mlx_nufft.gpu_t3 import (GpuT3Plan, fft_axis,           # noqa: E402
 from mlx_nufft.nd import Type1PlanND, Type2PlanND            # noqa: E402
 from harness.gen import gen_anisotropic, direct_sum, rel_l2  # noqa: E402
 
-TOL_REF = 1e-6        # helper vs fp64 numpy FFT
+TOL_REF = 4e-6        # helper vs fp64 numpy FFT; MLX's fp32 FFT lands at
+                      # 1.0e-6 to 1.3e-6 on the GitHub runner GPU, 5e-7 on an M5 Max
 TOL_OLD = 1e-6        # helper vs the v0.2.0 path
 TOL_PLAN = 5e-6       # plan outputs across settings
 

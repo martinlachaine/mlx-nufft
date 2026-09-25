@@ -111,8 +111,18 @@ def main():
             ts.append(time.perf_counter() - t0)
         return min(ts) * 1000
 
-    for label, N, P, B in [("spread-dominated (dense)", (512, 512), 4_000_000, 5),
-                           ("fft-dominated (sparse)", (4096, 4096), 400_000, 5)]:
+    speed_cases = [("spread-dominated (dense)", (512, 512), 4_000_000, 5),
+                   ("fft-dominated (sparse)", (4096, 4096), 400_000, 5)]
+    # The 8192^2 batch of 5 grids needs several GiB of Metal buffers; the
+    # GitHub macOS runner (3.5 GiB max buffer) crashes with a GPU
+    # out-of-memory that cannot be caught, so this timing-only section
+    # runs only on GPUs of the same class as test_large_t3_batch.
+    cap = int(mx.device_info().get("max_buffer_length", 0))
+    if cap and cap < 24 * 2 ** 30:
+        print(f"  SKIP: needs max_buffer_length >= 24 GiB (this GPU has "
+              f"{cap / 2**30:.1f} GiB)")
+        speed_cases = []
+    for label, N, P, B in speed_cases:
         x = [rng.uniform(-np.pi, np.pi, P) for _ in range(2)]
         cs = (rng.standard_normal((B, P))
               + 1j * rng.standard_normal((B, P))).astype(np.complex64)
