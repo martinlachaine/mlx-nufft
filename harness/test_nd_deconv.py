@@ -131,16 +131,14 @@ if __name__ == "__main__":
                                    kernel_ft(xi, beta, w))
         check_true(f"fallback sigma 1.25 w={w}: kernel_ft_fast equals the "
                    "quadrature bit for bit on the mode arguments", same)
-    # forced fallback: a certified kernel with its cached fit disabled (the
-    # sigma=2 kernel at eps=1e-3, so the plan pins upsampfac=2.0: the 3D
-    # default at this eps resolves to sigma=1.25, a different kernel)
+    # forced fallback: a certified kernel with its cached fit disabled
     w, beta = kernel_params(1e-3, 2.0)
     key = (float(beta), int(w), 128)
     missing = object()
     saved = sizing._CHEB_CACHE.get(key, missing)
     sizing._CHEB_CACHE[key] = None
     try:
-        plan = Type1PlanND(pts(3, 500), (24, 20, 16), eps=1e-3, upsampfac=2.0)
+        plan = Type1PlanND(pts(3, 500), (24, 20, 16), eps=1e-3)
         check_true(f"forced fallback w={plan.w} (fit disabled): decs equal "
                    "the quadrature bit for bit",
                    bit_equal(plan.decs, quad_decs(plan)))
