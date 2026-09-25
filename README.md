@@ -140,6 +140,9 @@ the bridge is built.
 
 - Computation is fp32-grade (crit64): `eps` below 1e-6 clamps with a warning;
   complex128 inputs are accepted and returned but transformed at fp32 grade.
+- Type 3 runs at upsampling factor 1.25 with the kernel width capped at 8 on
+  full 3D grids (FINUFFT's single-precision rule), so its achievable error is
+  about 5e-5 for `eps` at or below 1e-5, in line with single-precision FINUFFT.
 - `modeord=1` (FFT ordering) is not implemented.
 - 1D/2D type 3 run as degenerate slices of the 3D type-3 kernel.
 - Plans hold points as plan state (`setpts`); `out=` and multi-vector
