@@ -31,6 +31,7 @@ download of the result; both are part of execute()):
 
 Usage: profile_stages.py [--reps 7] [--warm 2] [--wake-ms 100]
                          [--cases id[,id..]] [--list] [--tag profile_baseline]
+       profile_stages.py --render results/<tag>.json   (markdown only)
 Writes results/<tag>.json and results/<tag>.md. results/ is gitignored: copy
 the .md to harness/PROFILE_BASELINE_<version>.md to keep a baseline with the
 branch.
@@ -558,6 +559,11 @@ def to_markdown(doc):
         out.append("")
     out.append("## Plan variants, build time and memory")
     out.append("")
+    out.append("staged vs whole rel-L2 compares the staged reproduction's "
+               "output with execute()'s; nonzero values come from the "
+               "run-to-run summation order of the atomic spreads, not from "
+               "the staging.")
+    out.append("")
     out.append("| case | eps | w | n_up | pts/cell | path | plan build (s) "
                "| peak GiB | staged vs whole rel-L2 |")
     out.append("|---|---|---|---|---|---|---|---|---|")
@@ -602,6 +608,12 @@ def main(argv):
     if "--list" in args:
         for c in CASES:
             print(c["id"])
+        return
+    if "--render" in args:          # re-render the markdown of a saved run
+        src = pathlib.Path(args[args.index("--render") + 1])
+        doc = json.loads(src.read_text())
+        src.with_suffix(".md").write_text(to_markdown(doc))
+        print(f"wrote {src.with_suffix('.md')}")
         return
     if "--reps" in args:
         reps = int(args[args.index("--reps") + 1])
