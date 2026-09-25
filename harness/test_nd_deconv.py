@@ -5,13 +5,16 @@ with sizing.kernel_ft_fast, as the type-3 plan does, instead of the
 128-node quadrature at every mode (which was the bulk of a 1D N=2^20 plan
 build). Gates: plan.decs vs the quadrature-built factors within the
 proxy's certified 1e-12 relative, dims 1/2/3, both plan types,
-representative w/beta/N including the 1D N=2^20 build; a kernel the proxy
-cannot certify (upsampfac 1.25, w=14) and a certified fit disabled by hand
-both give the quadrature factors bit for bit; type-1 and type-2 transforms
-(the factors are read by every path's crop / pad kernel) vs CPU FINUFFT in
-dims 1/2/3, the 1D case at N=2^20.
+representative w/beta/N including the 1D N=2^20 build; kernels the proxy
+cannot certify (upsampfac 1.25 at w=12 and 14, widths the fp32 width cap
+keeps every plan below, so kernel_ft_fast is called on the mode arguments
+directly) and a certified fit disabled by hand both give the quadrature
+factors bit for bit; type-1 and type-2 transforms (the factors are read by
+every path's crop / pad kernel) vs CPU FINUFFT in dims 1/2/3, the 1D case
+at N=2^20.
 """
 
+import contextlib
 import sys
 import pathlib
 
@@ -21,7 +24,8 @@ import finufft as cpu
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[0].parent))
 from harness.gen import rel_l2                           # noqa: E402
 from mlx_nufft import sizing                             # noqa: E402
-from mlx_nufft.sizing import kernel_ft, kernel_params    # noqa: E402
+from mlx_nufft.sizing import (kernel_ft, kernel_ft_fast,  # noqa: E402
+                              kernel_params, next235even)
 from mlx_nufft.nd import Type1PlanND, Type2PlanND        # noqa: E402
 
 rng = np.random.default_rng(31)
@@ -77,6 +81,19 @@ def certified(plan):
     return sizing._kernel_ft_cheb(plan.beta, plan.w, 128) is not None
 
 
+@contextlib.contextmanager
+def cap_lifted():
+    """kernel_params without the fp32 low-sigma width cap: the widths the
+    uncapped rule prescribes, which the fit declines from w=12 at sigma
+    1.25 (cap_kernel_width reads the two constants at call time)."""
+    saved = sizing.W_MAX_FP32_LOWSIGMA_3D, sizing.W_MAX_FP32_LOWSIGMA
+    sizing.W_MAX_FP32_LOWSIGMA_3D = sizing.W_MAX_FP32_LOWSIGMA = 16
+    try:
+        yield
+    finally:
+        sizing.W_MAX_FP32_LOWSIGMA_3D, sizing.W_MAX_FP32_LOWSIGMA = saved
+
+
 if __name__ == "__main__":
     print("== 1. deconvolution factors: Chebyshev proxy vs quadrature ==")
     cases = [                                   # (cls, N, eps, upsampfac)
@@ -96,13 +113,24 @@ if __name__ == "__main__":
         check(f"{tag}: decs vs quadrature max rel",
               max_rel(plan.decs, quad_decs(plan)), DEC_THR)
 
-    # natural fallback: sigma 1.25 at eps 1e-8 gives w=14, which the fit
-    # cannot certify, so kernel_ft_fast runs the quadrature itself
-    plan = Type1PlanND(pts(2, 500), (64, 40), eps=1e-8, upsampfac=1.25)
-    check_true(f"fallback sigma 1.25 w={plan.w}: fit declined",
-               not certified(plan))
-    check_true(f"fallback sigma 1.25 w={plan.w}: decs equal the quadrature "
-               "bit for bit", bit_equal(plan.decs, quad_decs(plan)))
+    # natural fallback, at the sizing level: sigma 1.25 at eps 1e-7 / 1e-8
+    # prescribes w=12 / 14, widths the fit cannot certify. The fp32 width
+    # cap keeps every plan at w <= 10 there, so the deconvolution call is
+    # exercised directly: kernel_ft_fast on the mode arguments 2*pi*k/n_up
+    # must return the quadrature bit for bit
+    for eps in (1e-7, 1e-8):
+        with cap_lifted():
+            w, beta = kernel_params(eps, 1.25)
+        check_true(f"fallback sigma 1.25 w={w}: fit declined",
+                   w >= 12 and sizing._kernel_ft_cheb(beta, w, 128) is None)
+        same = True
+        for N in (40, 513, 4096):
+            nu = next235even(max(2 * w, int(np.ceil(1.25 * N))))
+            xi = 2.0 * np.pi * np.arange(-(N // 2), N - N // 2) / nu
+            same &= np.array_equal(kernel_ft_fast(xi, beta, w),
+                                   kernel_ft(xi, beta, w))
+        check_true(f"fallback sigma 1.25 w={w}: kernel_ft_fast equals the "
+                   "quadrature bit for bit on the mode arguments", same)
     # forced fallback: a certified kernel with its cached fit disabled
     w, beta = kernel_params(1e-3, 2.0)
     key = (float(beta), int(w), 128)
