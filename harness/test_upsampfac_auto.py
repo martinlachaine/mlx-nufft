@@ -2,19 +2,22 @@
 (nd.py: upsampfac=None / "auto" resolves per plan; nd.UPSAMP_AUTO_*).
 
 (a) Resolution table over dims 1/2/3, both types, eps in {1e-2, 1e-3,
-    1e-4, 1e-5} plus the policy's own thresholds, small and 256^3-class
-    mode counts: nd._resolve_upsampfac agrees with an independent
-    statement of the rule (dims below UPSAMP_AUTO_MIN_DIM keep 2.0; 3D
-    type 2 takes 1.25 at eps >= UPSAMP_AUTO_EPS_T2; 3D type 1 at eps >=
-    UPSAMP_AUTO_EPS_T1, or at eps >= UPSAMP_AUTO_EPS_T1_BIG with at least
-    UPSAMP_AUTO_T1_BIG_MODES modes), and plans built at a subset of the
-    table carry it (plan.upsampfac, plan.sigma, the kernel width). The
-    shipped constants are pinned.
-(b) An explicit upsampfac (2.0 or 1.25) is honored by the plans, by the
-    functional API and by Plan (setpts and the lazily built adjoint); the
-    None / "auto" / 0 sentinels resolve the policy; MLX_NUFFT_UPSAMPFAC
-    replaces the resolved default, is beaten by an explicit value, "auto"
-    restores the policy and an unparseable value raises.
+    1e-4, 1e-5} plus the policy's own thresholds, and mode counts under,
+    one short of, at and one past the UPSAMP_AUTO_MIN_MODES floor plus
+    the 256^3 class: nd._resolve_upsampfac agrees with an independent
+    statement of the rule (dims below UPSAMP_AUTO_MIN_DIM and grids under
+    UPSAMP_AUTO_MIN_MODES modes keep 2.0; 3D type 2 takes 1.25 at eps >=
+    UPSAMP_AUTO_EPS_T2; 3D type 1 at eps >= UPSAMP_AUTO_EPS_T1, or at eps
+    >= UPSAMP_AUTO_EPS_T1_BIG with at least UPSAMP_AUTO_T1_BIG_MODES
+    modes), and plans built at a subset of the table carry it
+    (plan.upsampfac, plan.sigma, the kernel width). The shipped constants
+    are pinned.
+(b) An explicit upsampfac (2.0 or 1.25, also under the mode floor) is
+    honored by the plans, by the functional API and by Plan (setpts and
+    the lazily built adjoint); the None / "auto" / 0 sentinels resolve
+    the policy; MLX_NUFFT_UPSAMPFAC replaces the resolved default, is
+    beaten by an explicit value, "auto" restores the policy and an
+    unparseable value raises.
 (c) An auto plan's output equals an explicit plan's at the resolved sigma
     bit for bit (type 2, whose gather is deterministic; type 1 within the
     T1_NOISE_GATE atomics allowance when two explicit runs differ) and
@@ -46,11 +49,12 @@ from mlx_nufft.nd import Type1PlanND, Type2PlanND                  # noqa: E402
 from mlx_nufft.sizing import kernel_params                         # noqa: E402
 
 EPS_TABLE = (1e-2, 1e-3, 1e-4, 1e-5)
-SMALL = {1: (4096,), 2: (64, 60), 3: (32, 30, 28)}
+SMALL = {1: (4096,), 2: (64, 60), 3: (32, 30, 28)}      # 3D: 26880 modes
 BIG = {1: (2 ** 24,), 2: (4096, 4096), 3: (256, 256, 256)}   # 2^24 modes
+FLOOR3 = ((32, 32, 31), (32, 32, 32), (33, 32, 32))   # 2^15 -1024, 2^15, +1024
+MID3 = (36, 32, 30)         # 34560 modes: the 3D working grid above the floor
 P_PLAN = 3000               # points for the plan-level checks
 P_BITS = 20000              # (c)
-N_BITS = (32, 30, 28)
 ACC_N = 64                  # (d): 64^3 modes
 ACC_M = 200_000
 ACC_EPS = (1e-3, 1e-4)
@@ -80,13 +84,15 @@ def rule(dim, typ, eps, n_modes):
     low, high = nd.UPSAMP_AUTO_LOW, nd.UPSAMP_AUTO_HIGH
     if dim < nd.UPSAMP_AUTO_MIN_DIM:
         return high
+    modes = int(np.prod(n_modes))
+    if modes < nd.UPSAMP_AUTO_MIN_MODES:
+        return high
     if typ == 2:
         return low if eps >= nd.UPSAMP_AUTO_EPS_T2 else high
-    big = int(np.prod(n_modes)) >= nd.UPSAMP_AUTO_T1_BIG_MODES
     if eps >= nd.UPSAMP_AUTO_EPS_T1:
         return low
-    if big and eps >= nd.UPSAMP_AUTO_EPS_T1_BIG:
-        return low
+    if modes >= nd.UPSAMP_AUTO_T1_BIG_MODES:
+        return low if eps >= nd.UPSAMP_AUTO_EPS_T1_BIG else high
     return high
 
 
@@ -107,14 +113,21 @@ def env_upsampfac(value):
 
 def check_table():
     print("== (a) resolution table ==")
-    shipped = (nd.UPSAMP_AUTO_MIN_DIM, nd.UPSAMP_AUTO_EPS_T2,
-               nd.UPSAMP_AUTO_EPS_T1, nd.UPSAMP_AUTO_EPS_T1_BIG,
-               nd.UPSAMP_AUTO_T1_BIG_MODES, nd.UPSAMP_AUTO_LOW,
-               nd.UPSAMP_AUTO_HIGH)
-    check("shipped constants", shipped == (3, 1e-4, 1e-3, 1e-4, 2 ** 24,
-                                           1.25, 2.0),
-          "MIN_DIM 3, EPS_T2 1e-4, EPS_T1 1e-3, EPS_T1_BIG 1e-4, "
-          "T1_BIG_MODES 2^24, low 1.25, high 2.0")
+    shipped = (nd.UPSAMP_AUTO_MIN_DIM, nd.UPSAMP_AUTO_MIN_MODES,
+               nd.UPSAMP_AUTO_EPS_T2, nd.UPSAMP_AUTO_EPS_T1,
+               nd.UPSAMP_AUTO_EPS_T1_BIG, nd.UPSAMP_AUTO_T1_BIG_MODES,
+               nd.UPSAMP_AUTO_LOW, nd.UPSAMP_AUTO_HIGH)
+    check("shipped constants",
+          shipped == (3, 2 ** 15, 1e-4, 1e-3, 1e-4, 2 ** 24, 1.25, 2.0),
+          "MIN_DIM 3, MIN_MODES 2^15, EPS_T2 1e-4, EPS_T1 1e-3, EPS_T1_BIG "
+          "1e-4, T1_BIG_MODES 2^24, low 1.25, high 2.0")
+    floor = nd.UPSAMP_AUTO_MIN_MODES
+    sizes = [int(np.prod(N)) for N in FLOOR3]
+    check("floor rows straddle UPSAMP_AUTO_MIN_MODES",
+          sizes == [floor - 1024, floor, floor + 1024]
+          and int(np.prod(SMALL[3])) < floor <= int(np.prod(MID3)),
+          f"{sizes}, small {int(np.prod(SMALL[3]))}, "
+          f"working {int(np.prod(MID3))}")
     eps_list = sorted({*EPS_TABLE, nd.UPSAMP_AUTO_EPS_T2,
                        nd.UPSAMP_AUTO_EPS_T1, nd.UPSAMP_AUTO_EPS_T1_BIG},
                       reverse=True)
@@ -123,8 +136,10 @@ def check_table():
     bad = []
     n_rows = 0
     for dim in (1, 2, 3):
+        grids = (SMALL[dim], BIG[dim]) if dim < 3 else \
+            (SMALL[3],) + FLOOR3 + (BIG[3],)
         for typ in (1, 2):
-            for N in (SMALL[dim], BIG[dim]):
+            for N in grids:
                 got = [nd._resolve_upsampfac(None, dim, typ, e, N)[0]
                        for e in eps_list]
                 exp = [rule(dim, typ, e, N) for e in eps_list]
@@ -144,18 +159,19 @@ def check_table():
           and rule(3, 1, nd.UPSAMP_AUTO_EPS_T1_BIG, under) == got,
           f"upsampfac={got}")
     check("resolver names its rule", all(
-        nd._resolve_upsampfac(v, 3, 2, 1e-3, SMALL[3])[1] == r
+        nd._resolve_upsampfac(v, 3, 2, 1e-3, MID3)[1] == r
         for v, r in ((2.0, "explicit"), (1.25, "explicit"))
-    ) and nd._resolve_upsampfac(None, 3, 2, 1e-3, SMALL[3])[1] != "explicit",
+    ) and nd._resolve_upsampfac(None, 3, 2, 1e-3, MID3)[1] != "explicit",
           "explicit values report 'explicit', the policy its clause")
 
     x = {d: pts(d, P_PLAN) for d in (1, 2, 3)}
     cases = [(1, 1, SMALL[1], 1e-3), (1, 2, SMALL[1], 1e-2),
              (2, 1, SMALL[2], 1e-3), (2, 2, SMALL[2], 1e-2),
-             (3, 2, SMALL[3], 1e-2), (3, 2, SMALL[3], 1e-4),
-             (3, 2, SMALL[3], 1e-5),
-             (3, 1, SMALL[3], 1e-3), (3, 1, SMALL[3], 1e-4),
-             (3, 1, SMALL[3], 1e-5),
+             (3, 1, SMALL[3], 1e-3), (3, 2, SMALL[3], 1e-2),
+             (3, 1, FLOOR3[0], 1e-3), (3, 1, FLOOR3[1], 1e-3),
+             (3, 2, FLOOR3[0], 1e-3), (3, 2, FLOOR3[1], 1e-3),
+             (3, 2, MID3, 1e-2), (3, 2, MID3, 1e-4), (3, 2, MID3, 1e-5),
+             (3, 1, MID3, 1e-3), (3, 1, MID3, 1e-4), (3, 1, MID3, 1e-5),
              (3, 1, BIG[3], 1e-4), (3, 1, BIG[3], 1e-5),
              (3, 2, BIG[3], 1e-4)]
     for dim, typ, N, eps in cases:
@@ -172,16 +188,21 @@ def check_table():
 def check_explicit_and_env():
     print("== (b) explicit values, sentinels and MLX_NUFFT_UPSAMPFAC ==")
     x3, x1 = pts(3, P_PLAN), pts(1, P_PLAN)
-    N = SMALL[3]
+    N = MID3
     for cls, eps in ((Type2PlanND, 1e-3), (Type2PlanND, 1e-5),
                      (Type1PlanND, 1e-3), (Type1PlanND, 1e-5)):
         auto = rule(3, cls._NUFFT_TYPE, eps, N)
         for val in (2.0, 1.25):
             p = cls(x3, N, eps=eps, upsampfac=val)
-            check(f"{cls.__name__} 3D eps={eps:.0e} upsampfac={val} "
+            check(f"{cls.__name__} 3D N={N} eps={eps:.0e} upsampfac={val} "
                   f"(auto {auto})",
                   p.upsampfac == val and p.w == kernel_params(eps, val, 3)[0],
                   f"upsampfac={p.upsampfac} w={p.w}")
+    p = Type2PlanND(x3, SMALL[3], eps=1e-3, upsampfac=1.25)
+    check(f"Type2PlanND 3D N={SMALL[3]} eps=1e-03 upsampfac=1.25 (auto "
+          f"{rule(3, 2, 1e-3, SMALL[3])} under the mode floor)",
+          p.upsampfac == 1.25 and rule(3, 2, 1e-3, SMALL[3]) == 2.0,
+          f"upsampfac={p.upsampfac} w={p.w}")
     p = Type1PlanND(x1, SMALL[1], eps=1e-3, upsampfac=1.25)
     check("Type1PlanND 1D eps=1e-03 upsampfac=1.25 (auto 2.0)",
           p.upsampfac == 1.25, f"upsampfac={p.upsampfac} w={p.w}")
@@ -229,6 +250,10 @@ def check_explicit_and_env():
         check("env=1.25: Type1PlanND 3D eps=1e-05 (auto 2.0)",
               p.upsampfac == 1.25 and p.w == kernel_params(1e-5, 1.25, 3)[0],
               f"upsampfac={p.upsampfac} w={p.w}")
+        p = Type1PlanND(x3, SMALL[3], eps=1e-3)
+        check("env=1.25: Type1PlanND 3D eps=1e-03 under the mode floor "
+              "(auto 2.0)", p.upsampfac == 1.25,
+              f"upsampfac={p.upsampfac} w={p.w}")
         p = Type1PlanND(x1, SMALL[1], eps=1e-3)
         check("env=1.25: Type1PlanND 1D eps=1e-03 (auto 2.0)",
               p.upsampfac == 1.25, f"upsampfac={p.upsampfac} w={p.w}")
@@ -257,7 +282,7 @@ def check_explicit_and_env():
 def check_bits():
     print("== (c) auto plan output vs explicit plans ==")
     x = pts(3, P_BITS)
-    N = N_BITS
+    N = MID3
     c, fk = cplx(P_BITS), cplx(N)
     for eps in (1e-3, 1e-5):
         for typ, cls, inp in ((2, Type2PlanND, fk), (1, Type1PlanND, c)):
