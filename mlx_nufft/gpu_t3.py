@@ -23,7 +23,8 @@ import numpy as np
 import mlx.core as mx
 
 from .sizing import (kernel_params, kernel_ft, kernel_ft_fast,
-                     set_nhg_type3, next235even, cap_kernel_width)
+                     set_nhg_type3, next235even, cap_kernel_width,
+                     full_band_axes)
 
 PI = np.pi
 
@@ -296,11 +297,11 @@ def _build_df64_setup_kernel():
         header=_DF64_HDR, source="".join(body))
 
 
-def _inner_kernel_params(eps, sigma_inner):
+def _inner_kernel_params(eps, sigma_inner, nfull=None):
     """Width/beta for the inner interp kernel at a given (small) sigma."""
     ns = int(np.ceil(-np.log(eps) / (PI * np.sqrt(1.0 - 1.0 / sigma_inner))))
     ns = max(2, min(ns, 16))
-    ns = cap_kernel_width(ns, sigma_inner)    # same fp32 r_dyn guard as w
+    ns = cap_kernel_width(ns, sigma_inner, nfull)   # same r_dyn guard as w
     beta = 0.97 * PI * (1.0 - 1.0 / (2.0 * sigma_inner)) * ns
     return ns, beta
 
@@ -323,9 +324,10 @@ _OD_BIN_SHIFT = 64         # bin-id bias keeping GPU int division nonnegative
 
 def _od_tile_dims_t3(w, grid):
     """3D bin sizes m_d = 15 - w with padded tile p_d = m_d + w (nd.py's 3D
-    sizing with its w <= 8 guard relaxed: the t3 kernel at eps=1e-5,
-    sigma=1.25 has w=9, giving m=6^3, tile 15^3 = 27 KB, which fits the
-    28 KB threadgroup budget). None when the tile cannot fit."""
+    sizing with its w <= 8 guard relaxed: the t3 kernel at eps <= 1e-5,
+    sigma=1.25 has w=8 (three full-band axes) to 10 (slab, rod), giving
+    m=7^3 to 5^3, tile 15^3 = 27 KB, which fits the 28 KB threadgroup
+    budget). None when the tile cannot fit."""
     m = [15 - w] * 3
     p = [mi + w for mi in m]
     ptot = int(np.prod(p))
@@ -430,14 +432,6 @@ class GpuT3Plan:
         self.isign = int(np.sign(isign))
         self.eps = eps
         self.sigma = upsampfac
-        self.w, self.beta = kernel_params(eps, upsampfac)
-        w = self.w
-        if sigma_inner is None or sigma_inner == upsampfac:
-            self.sigma_in = upsampfac
-            self.w2, self.beta2 = self.w, self.beta
-        else:
-            self.sigma_in = sigma_inner
-            self.w2, self.beta2 = _inner_kernel_params(eps, sigma_inner)
 
         x64 = [np.asarray(v, dtype=np.float64) for v in x]
         s64 = [np.asarray(v, dtype=np.float64) for v in s]
@@ -445,20 +439,35 @@ class GpuT3Plan:
         self.M = s64[0].size
 
         # ---- sizing (fp64 host scalars) ----------------------------------
-        self.nf, self.gam, self.C, self.D = [], [], [], []
+        # extents first: the kernel width cap depends on how many axes reach
+        # the kernel's band edge (sizing.full_band_axes; a thin slab or rod
+        # axis does not)
+        xext, sext = [], []
         for d in range(3):
             if source_extent is not None:
-                xlo, xhi = (float(source_extent[d][0]),
-                            float(source_extent[d][1]))
+                xext.append((float(source_extent[d][0]),
+                             float(source_extent[d][1])))
             else:
-                xlo, xhi = float(x64[d].min()), float(x64[d].max())
-            C = 0.5 * (xlo + xhi)
-            D = 0.5 * (s64[d].min() + s64[d].max())
-            X = 0.5 * (xhi - xlo)
-            S = 0.5 * (s64[d].max() - s64[d].min())
-            nf, h, gam = set_nhg_type3(S, X, upsampfac, w)
+                xext.append((float(x64[d].min()), float(x64[d].max())))
+            sext.append((float(s64[d].min()), float(s64[d].max())))
+        X = [0.5 * (hi - lo) for lo, hi in xext]
+        S = [0.5 * (hi - lo) for lo, hi in sext]
+        self.nfull = full_band_axes(S, X)
+        self.w, self.beta = kernel_params(eps, upsampfac, self.nfull)
+        w = self.w
+        if sigma_inner is None or sigma_inner == upsampfac:
+            self.sigma_in = upsampfac
+            self.w2, self.beta2 = self.w, self.beta
+        else:
+            self.sigma_in = sigma_inner
+            self.w2, self.beta2 = _inner_kernel_params(eps, sigma_inner,
+                                                       self.nfull)
+        self.nf, self.gam, self.C, self.D = [], [], [], []
+        for d in range(3):
+            nf, h, gam = set_nhg_type3(S[d], X[d], upsampfac, w)
             self.nf.append(nf), self.gam.append(gam)
-            self.C.append(C), self.D.append(D)
+            self.C.append(0.5 * (xext[d][0] + xext[d][1]))
+            self.D.append(0.5 * (sext[d][0] + sext[d][1]))
         self.n_up = [next235even(int(np.ceil(self.sigma_in * nf)))
                      for nf in self.nf]
 
