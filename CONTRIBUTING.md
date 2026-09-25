@@ -15,7 +15,7 @@ include:
   the reference you compared against).
 
 Accuracy reports are most useful as a relative-L2 error against CPU `finufft`
-or a direct-summation oracle at a stated `eps` — see `harness/` for the
+or a direct-summation oracle at a stated `eps`; see `harness/` for the
 patterns used in the test suite.
 
 ## Development setup
@@ -41,6 +41,25 @@ under `harness/` for any behavior change.
 The `mlx` dependency is pinned (`mlx==0.31.2`) because the library works around
 version-specific Metal FFT behavior. If you need to bump it, re-validate
 `harness/test_gpu_small.py` and the full suite first, and say so in the PR.
+
+## Performance changes
+
+Measure before and after with the per-stage profiler, on an otherwise idle GPU:
+
+```bash
+.venv/bin/python harness/profile_stages.py            # full matrix, ~10 s
+.venv/bin/python harness/profile_stages.py --cases t2_3d_256,t3_3d_generic512
+```
+
+It reports the median of 7 warm runs per stage and writes `results/<tag>.md`;
+the tables committed as `harness/PROFILE_*.md` are the reference points for
+each release. A performance change should come with a way to compare both
+paths in one build (a module switch or one of the environment overrides
+`MLX_NUFFT_FFT_STRATEGY`, `MLX_NUFFT_PAD_PATH`, `MLX_NUFFT_UPSAMPFAC`) and with
+a test that pins the outputs: bit-identical for pure data-movement changes,
+within the existing CPU-reference tolerances otherwise. Changes that measure
+neutral are not merged, even when they look like they should help; the spread
+kernels on Apple GPUs are bound by atomics and memory traffic, not arithmetic.
 
 ## Pull requests
 
