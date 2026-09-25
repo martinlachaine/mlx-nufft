@@ -5,9 +5,23 @@ All formulas are ports of FINUFFT's setup_spreader() / set_nhg_type3()
 shapes match the CPU oracle's algorithm family.
 """
 
+import logging
+
 import numpy as np
 
 PI = np.pi
+_log = logging.getLogger(__name__)
+
+# FINUFFT setup_spreadinterp's single-precision guard ("ns reducing from N
+# to 8 to prevent r_{dyn}-related catastrophic cancellation"): the
+# deconvolution divides by the kernel FT, whose dynamic range across the
+# band, r_dyn = phihat(0)/phihat(pi/sigma), is 34 at w=8, 56 at w=9, 93 at
+# w=10 and 1863 at w=16 for sigma=1.25 (2 to 8 at every w for sigma=2), and
+# it multiplies the fp32 grid's rounding error, so past w=8 a wider kernel
+# makes the result worse, not better. The grid here is always fp32, so the
+# cap applies at every sigma < 2 (FINUFFT applies it at its one low sigma,
+# 1.25); at sigma=1.25 it engages below eps ~1.3e-5.
+W_MAX_FP32_LOWSIGMA = 8
 
 
 def next235even(n: int) -> int:
@@ -29,7 +43,8 @@ def kernel_params(eps: float, upsampfac: float):
     """Kernel width w and ES beta for tolerance eps at given upsampling factor.
 
     Port of FINUFFT setup_spreader(): for sigma=2, w = ceil(log10(10/eps));
-    otherwise w from the Liu lower-bound formula. beta = (beta/w)*w with the
+    otherwise w from the Liu lower-bound formula, then capped at
+    W_MAX_FP32_LOWSIGMA for sigma < 2. beta = (beta/w)*w with the
     FINUFFT-tuned ratios.
     """
     if upsampfac == 2.0:
@@ -37,6 +52,7 @@ def kernel_params(eps: float, upsampfac: float):
     else:
         ns = int(np.ceil(-np.log(eps) / (PI * np.sqrt(1.0 - 1.0 / upsampfac))))
     ns = max(2, min(ns, 16))
+    ns = cap_kernel_width(ns, upsampfac)
     betaoverns = 2.30
     if ns == 2:
         betaoverns = 2.20
@@ -48,6 +64,17 @@ def kernel_params(eps: float, upsampfac: float):
         gamma = 0.97
         betaoverns = gamma * PI * (1.0 - 1.0 / (2.0 * upsampfac))
     return ns, betaoverns * ns
+
+
+def cap_kernel_width(ns, upsampfac):
+    """Apply W_MAX_FP32_LOWSIGMA to a chosen width. A debug-level note, not a
+    warning: every sigma=1.25 plan at eps <= 1e-5 takes it, and the API
+    already warns once about the fp32 envelope when it clamps eps."""
+    if upsampfac < 2.0 and ns > W_MAX_FP32_LOWSIGMA:
+        _log.debug("kernel width %d reduced to %d at upsampfac=%g (fp32 "
+                   "r_dyn guard)", ns, W_MAX_FP32_LOWSIGMA, upsampfac)
+        ns = W_MAX_FP32_LOWSIGMA
+    return ns
 
 
 def es_kernel(d, beta, w):

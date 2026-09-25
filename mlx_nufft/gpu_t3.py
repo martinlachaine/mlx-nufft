@@ -23,7 +23,7 @@ import numpy as np
 import mlx.core as mx
 
 from .sizing import (kernel_params, kernel_ft, kernel_ft_fast,
-                     set_nhg_type3, next235even)
+                     set_nhg_type3, next235even, cap_kernel_width)
 
 PI = np.pi
 
@@ -300,6 +300,7 @@ def _inner_kernel_params(eps, sigma_inner):
     """Width/beta for the inner interp kernel at a given (small) sigma."""
     ns = int(np.ceil(-np.log(eps) / (PI * np.sqrt(1.0 - 1.0 / sigma_inner))))
     ns = max(2, min(ns, 16))
+    ns = cap_kernel_width(ns, sigma_inner)    # same fp32 r_dyn guard as w
     beta = 0.97 * PI * (1.0 - 1.0 / (2.0 * sigma_inner)) * ns
     return ns, beta
 
