@@ -15,11 +15,12 @@ precision-critical coordinate setup performed in double precision at plan time
 ("crit64"), so it reaches fp64-grade accuracy on hardware that has no native
 double precision.
 
-> **Paper:** [`mlx-nufft.pdf`](mlx-nufft.pdf), a technical report
-> describing the method, accuracy, and performance (types 1/2/3 in 1/2/3D, the
+> **Technical report (v0.1):** [`mlx-nufft.pdf`](mlx-nufft.pdf), describing
+> the method, accuracy, and performance (types 1/2/3 in 1/2/3D, the
 > crit64 precision mechanism, and M1 / M5 Max benchmarks).
-> The performance figures in the report reflect v0.1 and predate the v0.2
-> speedups; see `CHANGELOG.md` for current numbers.
+> The report describes the original implementation and benchmarks; v0.2
+> changes plan setup and execution. See [report status](REPORT.md) for context
+> and the [changelog](CHANGELOG.md#v020---2026-07-02) for v0.2 results.
 > Pin a tagged release rather than tracking `main`.
 
 ## Install
@@ -161,19 +162,13 @@ the bridge is built.
 
 ## Development and validation
 
-mlx-nufft is AI-assisted, human-directed research software. Its scope, numerical
-requirements, validation strategy, acceptance criteria, and release decisions
-are the author's; generative AI tools accelerated implementation, refactoring,
-test scaffolding, and documentation.
+The test suite checks numerical results against CPU FINUFFT and exact
+direct-summation oracles on small problems. It also checks transform conventions,
+adjoints, all supported dimensions and transform types, dtype/device behavior,
+and API compatibility (see [`harness/`](harness/)).
 
-Generated code was not trusted by default. Every component was validated against
-independent references: CPU FINUFFT, exact direct-summation oracles on small
-problems, transform-convention and adjoint checks, full dimension/type coverage,
-dtype/device behavior, and API-parity tests (see `harness/`).
-
-The author is responsible for the released software, including its design,
-limitations, and maintenance. Known limitations and hardware assumptions are
-documented; corrections are welcome via the issue tracker.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, test commands,
+and bug-reporting guidance.
 
 ## License & citation
 
