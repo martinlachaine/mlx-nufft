@@ -500,8 +500,12 @@ def to_markdown(doc):
            "puts the excess next to the cost of the stage boundaries at "
            "that floor.",
            "- inputs: n_trans=1, complex64, fixed seed, default plan "
-           "options (upsampfac 2.0 for types 1/2 and 1.25 for type 3, "
-           "spread_method auto, points_backend auto, MLX FFT, crit64). "
+           "options (upsampfac auto for types 1/2: nd.py's policy takes "
+           "sigma=1.25 on 3D grids of at least 2^15 modes at loose eps and "
+           "2.0 otherwise, recorded as sigma in each case's info, and "
+           "MLX_NUFFT_UPSAMPFAC=2.0|1.25 forces one for A/B runs; 1.25 for "
+           "type 3; spread_method auto, points_backend auto, MLX FFT, "
+           "crit64). "
            "h2d/d2h are the input upload and result download that "
            "execute() performs.",
            ""]
