@@ -14,14 +14,15 @@ time ('crit64', default) exactly as in types12/gpu_t3.
 Default upsampfac=None ("auto") resolves the upsampling factor per plan:
 2.0 (FINUFFT's default: at eps=1e-5 the ES kernel width is w=6 vs w=9 at
 sigma=1.25, i.e. w^d-fold fewer spread/interp taps for 2^d-fold grid
-memory) except in 3D at loose tolerances, where the 2^3-fold smaller grid
-wins on Apple GPUs and the plan takes 1.25: type 2 at eps >=
-UPSAMP_AUTO_EPS_T2, type 1 at eps >= UPSAMP_AUTO_EPS_T1 or at eps >=
-UPSAMP_AUTO_EPS_T1_BIG with at least UPSAMP_AUTO_T1_BIG_MODES modes (the
-constants and the measurements behind them follow PAD_PATH below). An
-explicit upsampfac (2.0 or 1.25) is always honored; the environment
-variable MLX_NUFFT_UPSAMPFAC (auto | 2.0 | 1.25) replaces the resolved
-default for A/B runs. Plans record the value in .upsampfac (and .sigma).
+memory) except in 3D, on grids of at least UPSAMP_AUTO_MIN_MODES modes at
+loose tolerances, where the 2^3-fold smaller grid wins on Apple GPUs and
+the plan takes 1.25: type 2 at eps >= UPSAMP_AUTO_EPS_T2, type 1 at eps
+>= UPSAMP_AUTO_EPS_T1 or at eps >= UPSAMP_AUTO_EPS_T1_BIG with at least
+UPSAMP_AUTO_T1_BIG_MODES modes (the constants and the measurements behind
+them follow PAD_PATH below). An explicit upsampfac (2.0 or 1.25) is
+always honored; the environment variable MLX_NUFFT_UPSAMPFAC (auto | 2.0
+| 1.25) replaces the resolved default for A/B runs. Plans record the
+value in .upsampfac (and .sigma).
 
 The 3D specialization of this module reproduces types12.py's algorithm
 exactly (same kernels modulo generation); types12.py remains untouched as
@@ -69,12 +70,18 @@ PAD_PATH = os.environ.get("MLX_NUFFT_PAD_PATH", "fused")
 # 2.02x at 128^3 / 256^3), while at eps=1e-4 type 1 only pays on
 # 256^3-class grids (1.87x; 0.88x at 128^3); at eps <= 1e-5 the fp32 grid
 # at sigma=1.25 is floor-limited (~5e-5) and sigma=2 stays. 1D and 2D are
-# neutral or worse at sigma=1.25 and keep 2.0. Where 1.25 is taken the
-# error is 1.3x to 1.5x sigma=2's at the same eps (the same eps grade).
-# The environment variable MLX_NUFFT_UPSAMPFAC=auto|2.0|1.25 replaces the
-# resolved default (read when a plan resolves it; an explicit constructor
-# argument wins over it). The rule that fired is logged at DEBUG level.
+# neutral or worse at sigma=1.25 and keep 2.0. The sigma=1.25 gain comes
+# from FFT and pad traffic, negligible on small grids, while its accuracy
+# penalty is largest there: at eps=1e-3 the (24, 20, 16) and (32, 32, 24)
+# grids land at 4.7e-3 against the harness gate of 4.2e-3 where 64^3
+# gives 3.8e-3 and 128^3 3.5e-3, so grids under UPSAMP_AUTO_MIN_MODES
+# modes keep 2.0 for both types. Where 1.25 is taken the error is 1.3x to
+# 1.6x sigma=2's at the same eps (the same eps grade). The environment
+# variable MLX_NUFFT_UPSAMPFAC=auto|2.0|1.25 replaces the resolved default
+# (read when a plan resolves it; an explicit constructor argument wins
+# over it). The rule that fired is logged at DEBUG level.
 UPSAMP_AUTO_MIN_DIM = 3             # sigma=1.25 defaults only from this dim
+UPSAMP_AUTO_MIN_MODES = 2 ** 15     #   and only from this many modes
 UPSAMP_AUTO_EPS_T2 = 1e-4           # type 2: 1.25 at eps >= this
 UPSAMP_AUTO_EPS_T1 = 1e-3           # type 1: 1.25 at eps >= this, or
 UPSAMP_AUTO_EPS_T1_BIG = 1e-4       #   at eps >= this on a grid of
@@ -99,6 +106,8 @@ def _resolve_upsampfac(upsampfac, dim, nufft_type, eps, n_modes):
                              f"got {env!r}") from None
     if dim < UPSAMP_AUTO_MIN_DIM:
         return UPSAMP_AUTO_HIGH, "dim < UPSAMP_AUTO_MIN_DIM"
+    if int(np.prod(n_modes)) < UPSAMP_AUTO_MIN_MODES:
+        return UPSAMP_AUTO_HIGH, "prod(n_modes) < UPSAMP_AUTO_MIN_MODES"
     if nufft_type == 2:
         if eps >= UPSAMP_AUTO_EPS_T2:
             return UPSAMP_AUTO_LOW, "type 2, eps >= UPSAMP_AUTO_EPS_T2"
