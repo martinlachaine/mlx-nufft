@@ -24,7 +24,7 @@ the validated reference implementation.
 import numpy as np
 import mlx.core as mx
 
-from .sizing import kernel_params, kernel_ft, next235even
+from .sizing import kernel_params, kernel_ft_fast, next235even
 from .gpu_t3 import _es_msl, fft_axis, _DF64_HDR
 
 PI = np.pi
@@ -149,13 +149,17 @@ class _PointsND:
 
         # mode deconvolution: 1/phihat(2 pi k / n_up); uncentered fine grid
         # (u_l = l*h, x folded into [0, 2pi)) => no (-1)^k half-grid factor.
+        # phihat comes from the cached Chebyshev fit (certified to 1e-12
+        # relative against the quadrature, which it falls back to when the
+        # fit cannot certify), as in the type-3 plan: the 128-node quadrature
+        # over every mode was the bulk of a 1D N=2^20 plan build.
         # FFT normalization for isign=+1 (mx ifft includes 1/n per axis)
         # folded into dim 0.
         decs = []
         for d in range(self.dim):
             k = np.arange(-(self.N[d] // 2),
                           self.N[d] - self.N[d] // 2, dtype=np.float64)
-            ph = kernel_ft(2.0 * PI * k / self.n_up[d], self.beta, w)
+            ph = kernel_ft_fast(2.0 * PI * k / self.n_up[d], self.beta, w)
             decs.append(1.0 / ph)
         if self.isign > 0:
             decs[0] = decs[0] * float(np.prod([float(n) for n in self.n_up]))
