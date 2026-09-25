@@ -19,6 +19,8 @@ sigma_inner: optional smaller upsampling for the inner type-2 grid (with a
 correspondingly wider interp kernel) to cut the dominant memory term.
 """
 
+import os
+
 import numpy as np
 import mlx.core as mx
 
@@ -47,6 +49,45 @@ _FFT_POW2_MAX = 2 ** 20   # mlx 0.31.2: pow2 lengths above this hit a missing
                           # four_step_mem_8192 Metal kernel; route through our
                           # own four-step split instead (needed for 1D NUFFTs)
 _SLAB_THRESHOLD = 3e9
+
+# ---- FFT path switches (perf A/B; correctness in harness/test_fft_paths.py)
+# Each is read at call time, so it can be flipped on the module between runs;
+# the MLX_NUFFT_* environment variables set the process-wide default (for
+# profile_stages.py A/B runs without editing source).
+# FFT_STRATEGY: how fft_grid_stages (the type-3 3D chain) transforms a native
+# length axis that is not the last axis, and which kernel the four-step's
+# T1/T3 layout passes use.
+#   "strided"   mx.fft.fft(H, axis=ax). MLX first copies the grid into a
+#               layout with that axis unit-stride (a general strided copy,
+#               scattered on one side; on both sides when the input already
+#               is such a layout), runs the FFT there and leaves the result
+#               in that permuted layout, so the consumer's view or reshape
+#               pays one more full copy back to natural order. Four-step
+#               T1/T3 are mx.contiguous(mx.transpose(..)). v0.2.0 behaviour.
+#   "transpose" every library FFT runs on the last axis: a non-last axis is
+#               brought last by a 32x32 threadgroup-tiled transpose (unit-
+#               stride loads and stores), and one final tiled transpose
+#               restores natural order. Same pass count as "strided" on a 3D
+#               grid (3 FFTs + 3 layout passes, 12 grid-sizes of traffic) but
+#               every layout pass is coalesced on both sides and the output
+#               is natural (no deferred copy). Four-step T1/T3 use the same
+#               kernel.
+FFT_STRATEGY = os.environ.get("MLX_NUFFT_FFT_STRATEGY", "strided")
+# Axes of length <= _SMALL_AXIS_DFT (0 disables) use a dense DFT kernel (one
+# thread per column against an n x n complex64 table) instead of an FFT
+# launch: one in-place pass that keeps the natural layout whatever the axis
+# position, where a strided 16- or 24-cell axis of a 1D/2D embedding
+# otherwise costs MLX's copy, the FFT and the deferred copy back. Off on the
+# contiguous last axis by default (same pass count as the native FFT there);
+# _SMALL_AXIS_DFT_LAST = True extends it for A/B.
+_SMALL_AXIS_DFT = int(os.environ.get("MLX_NUFFT_SMALL_AXIS_DFT", "32"))
+_SMALL_AXIS_DFT_LAST = (
+    os.environ.get("MLX_NUFFT_SMALL_AXIS_DFT_LAST", "0") == "1")
+# Four-step twiddle: fuse the (k2, f1) multiply into the T2 transpose (one
+# tiled pass) instead of a broadcast multiply followed by a contiguous
+# transpose (two passes). False restores the v0.2.0 separate multiply.
+_FOUR_STEP_FUSED_TWIDDLE = (
+    os.environ.get("MLX_NUFFT_FUSED_TWIDDLE", "1") == "1")
 
 # mx.fast.metal_kernel buffers are indexed with int32: a kernel input/output
 # may hold at most 2**31-1 elements (probe-confirmed: 2147483647 OK,
@@ -111,6 +152,266 @@ def _split_native(n):
     return _split_n(n)
 
 
+def _twiddle_table(n, inverse, cache):
+    """Four-step twiddles T[k2, f1] = exp(sgn 2 pi i f1 k2 / n) as a (n2, n1)
+    complex64 table (n1, n2 from _split_n), cached by (n, sgn) when a cache
+    dict is given."""
+    n1, n2 = _split_n(n)
+    sgn = +1.0 if inverse else -1.0
+    key = (n, sgn)
+    if cache is not None and key in cache:
+        return cache[key]
+    k2 = np.arange(n2, dtype=np.float64)[:, None]
+    f1 = np.arange(n1, dtype=np.float64)[None, :]
+    T = mx.array(np.exp(sgn * 2j * PI * f1 * k2 / n).astype(np.complex64))
+    if cache is not None:
+        cache[key] = T
+    return T
+
+
+# ---- tiled layout kernel (transposes of the four-step and of the 3D chain)
+_perm_kernels = {}
+
+
+def _row_strides(shape):
+    s = [1] * len(shape)
+    for d in range(len(shape) - 2, -1, -1):
+        s[d] = s[d + 1] * shape[d + 1]
+    return tuple(s)
+
+
+def _perm_kernel(shape, in_strides, t_strides):
+    """Tiled permutation kernel out[i] = X[i . in_strides] (* T[i . t_strides]
+    when t_strides is given) for a row-major complex64 out of `shape` (no
+    size-1 dims), X read as a flat row-contiguous buffer. Exactly one out dim
+    a has input stride 1 and it is not the last dim b: 32x32 threadgroup
+    tiles over (a, b) make the loads unit-stride in X and the stores unit-
+    stride in out (the general mx copy is scattered on one side); the other
+    dims are linearized over the grid's z. Compile-time constants, cached.
+    grid=(ceil(shape[a]/32)*32, ceil(shape[b]/32)*32, prod(other dims)),
+    threadgroup=(32, 32, 1).
+    """
+    key = (shape, in_strides, t_strides)
+    k = _perm_kernels.get(key)
+    if k is not None:
+        return k
+    m = len(shape)
+    a, b = in_strides.index(1), m - 1
+    out_strides = _row_strides(shape)
+    tw = t_strides is not None
+    dec = ["size_t z = tg.z, xo = 0, oo = 0" + (", to = 0;" if tw else ";")]
+    for d in reversed([d for d in range(m) if d != a and d != b]):
+        dec.append(f"{{ size_t q = z % {shape[d]}; z /= {shape[d]}; "
+                   f"xo += q * {in_strides[d]}; oo += q * {out_strides[d]};"
+                   + (f" to += q * {t_strides[d]};" if tw else "") + " }")
+    mul = f"""
+        size_t it = to + (size_t)ia * {t_strides[a]} + (size_t)jb * {t_strides[b]};
+        float tr = T[it].real, ti = T[it].imag;
+        float pr = vr * tr - vi * ti;
+        vi = vr * ti + vi * tr;
+        vr = pr;""" if tw else ""
+    src = f"""
+    threadgroup float2 tile[32][33];
+    uint3 tg = threadgroup_position_in_grid;
+    uint3 tl = thread_position_in_threadgroup;
+    {' '.join(dec)}
+    int ia = (int)(tg.x * 32 + tl.x);
+    int jb = (int)(tg.y * 32 + tl.y);
+    if (ia < {shape[a]} && jb < {shape[b]}) {{
+        size_t ix = xo + (size_t)ia + (size_t)jb * {in_strides[b]};
+        float vr = X[ix].real, vi = X[ix].imag;{mul}
+        tile[tl.y][tl.x] = float2(vr, vi);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int ia2 = (int)(tg.x * 32 + tl.y);
+    int jb2 = (int)(tg.y * 32 + tl.x);
+    if (ia2 < {shape[a]} && jb2 < {shape[b]}) {{
+        float2 v = tile[tl.x][tl.y];
+        device float* Of = (device float*) out;
+        size_t io = oo + (size_t)ia2 * {out_strides[a]} + (size_t)jb2;
+        Of[2*io] = v.x; Of[2*io+1] = v.y;
+    }}
+"""
+    name = ("nufft_perm_" + "x".join(map(str, shape)) + "_s"
+            + "x".join(map(str, in_strides))
+            + ("_t" + "x".join(map(str, t_strides)) if tw else ""))
+    k = mx.fast.metal_kernel(
+        name=name, input_names=["X", "T"] if tw else ["X"],
+        output_names=["out"], source=src)
+    _perm_kernels[key] = k
+    return k
+
+
+def _tiled_permute(X, shape, in_strides, T=None, t_strides=None):
+    """Row-major complex64 array out[i] = X[i . in_strides] (* T[i . t_strides])
+    of the given shape: one layout pass over the row-contiguous X (read flat)
+    through _perm_kernel. Size-1 dims are dropped before tiling. Falls back
+    to an mx strided view + contiguous copy when the unit-stride dim is
+    already last or the array exceeds the metal_kernel int32 element cap."""
+    keep = [d for d, s in enumerate(shape) if s != 1]
+    shp = tuple(int(shape[d]) for d in keep)
+    ins = tuple(int(in_strides[d]) for d in keep)
+    tw = T is not None
+    ts = tuple(int(t_strides[d]) for d in keep) if tw else None
+    total = int(np.prod(shape))
+    a = ins.index(1)
+    if a == len(shp) - 1 or total > _MK_MAX_ELEMS:
+        Y = mx.as_strided(X.reshape(-1), shp, ins)
+        if tw:
+            Y = Y * mx.as_strided(T.reshape(-1), shp, ts)
+        return mx.contiguous(Y).reshape(shape)
+    outer = int(np.prod([shp[d] for d in range(len(shp))
+                         if d != a and d != len(shp) - 1]))
+    out = _perm_kernel(shp, ins, ts)(
+        inputs=[X, T] if tw else [X],
+        output_shapes=[(total,)], output_dtypes=[mx.complex64],
+        grid=(-(-shp[a] // 32) * 32, -(-shp[-1] // 32) * 32, outer),
+        threadgroup=(32, 32, 1))[0]
+    return out.reshape(shape)
+
+
+# ---- dense DFT for short axes ------------------------------------------
+_DFT_TG = 256
+_dft_kernels = {}
+_dft_tables = {}
+
+
+def _small_dft_ok(n, last):
+    return 0 < n <= _SMALL_AXIS_DFT and (not last or _SMALL_AXIS_DFT_LAST)
+
+
+def _dft_table(n, inverse, cache):
+    """W[f, k] = exp(sgn 2 pi i f k / n) (with the 1/n of mx.fft.ifft when
+    inverse), complex64, cached by ("dft", n, sgn)."""
+    sgn = +1.0 if inverse else -1.0
+    key = ("dft", n, sgn)
+    src = cache if cache is not None else _dft_tables
+    W = src.get(key)
+    if W is None:
+        f = np.arange(n, dtype=np.float64)
+        W = np.exp(sgn * 2j * PI * np.outer(f, f) / n)
+        if inverse:
+            W /= n
+        W = mx.array(W.astype(np.complex64))
+        src[key] = W
+    return W
+
+
+def _dft_kernel(n, R, nt):
+    """Dense n-point DFT of every column of a (L, n, R) row-contiguous
+    complex64 array, one thread per (l, r) column (nt = L*R columns): the n
+    strided inputs are held in registers and the n x n table W is staged in
+    threadgroup memory. Adjacent threads read adjacent r (or, at R=1,
+    adjacent rows), so the single pass is unit-stride on both sides and the
+    layout is unchanged. grid=(ceil(nt/256)*256, 1, 1), threadgroup (256,1,1);
+    the bounds test sits after the barrier so every threadgroup is full."""
+    key = (n, R, nt)
+    k = _dft_kernels.get(key)
+    if k is not None:
+        return k
+    src = f"""
+    uint t = thread_position_in_grid.x;
+    threadgroup float2 Wt[{n * n}];
+    for (uint q = thread_position_in_threadgroup.x; q < {n * n}u; q += {_DFT_TG}u)
+        Wt[q] = float2(W[q].real, W[q].imag);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t >= {nt}u) return;
+    size_t base = (size_t)(t / {R}u) * {n * R} + (size_t)(t % {R}u);
+    float xr[{n}], xi[{n}];
+    for (int k = 0; k < {n}; ++k) {{
+        xr[k] = X[base + (size_t)k * {R}].real;
+        xi[k] = X[base + (size_t)k * {R}].imag;
+    }}
+    device float* Yf = (device float*) Y;
+    for (int f = 0; f < {n}; ++f) {{
+        float ar = 0.0f, ai = 0.0f;
+        for (int k = 0; k < {n}; ++k) {{
+            float2 w = Wt[f * {n} + k];
+            ar = metal::fma(xr[k], w.x, metal::fma(-xi[k], w.y, ar));
+            ai = metal::fma(xr[k], w.y, metal::fma(xi[k], w.x, ai));
+        }}
+        size_t o = base + (size_t)f * {R};
+        Yf[2*o] = ar; Yf[2*o+1] = ai;
+    }}
+"""
+    k = mx.fast.metal_kernel(
+        name=f"nufft_dft{n}_r{R}_n{nt}", input_names=["X", "W"],
+        output_names=["Y"], source=src)
+    _dft_kernels[key] = k
+    return k
+
+
+def _dft_small(H, axis, inverse, twiddle_cache):
+    """Dense DFT along `axis` of the row-contiguous H (any position), same
+    shape and layout out."""
+    shp = H.shape
+    n = shp[axis]
+    L = int(np.prod(shp[:axis]))
+    R = int(np.prod(shp[axis + 1:]))
+    nt = L * R
+    if nt * n > _MK_MAX_ELEMS:
+        return (mx.fft.ifft if inverse else mx.fft.fft)(H, axis=axis)
+    Y = _dft_kernel(n, R, nt)(
+        inputs=[H, _dft_table(n, inverse, twiddle_cache)],
+        output_shapes=[(nt * n,)], output_dtypes=[mx.complex64],
+        grid=(-(-nt // _DFT_TG) * _DFT_TG, 1, 1),
+        threadgroup=(_DFT_TG, 1, 1))[0]
+    return Y.reshape(shp)
+
+
+def _four_step(H, axis, inverse, twiddle_cache, scrambled):
+    """Four-step Cooley-Tukey along `axis` (see fft_axis for the scheme).
+
+    Layout passes: T1 and T3 run through the tiled kernel under FFT_STRATEGY
+    "transpose" and through mx.contiguous(mx.transpose(..)) under "strided";
+    the twiddle multiply is fused into T2 (one tiled pass) when
+    _FOUR_STEP_FUSED_TWIDDLE, else it is a broadcast multiply followed by
+    the strategy's transpose. scrambled skips T3 (see fft_axis_scrambled).
+    """
+    n = H.shape[axis]
+    fft1 = mx.fft.ifft if inverse else mx.fft.fft
+    n1, n2 = _split_n(n)
+    T = _twiddle_table(n, inverse, twiddle_cache)
+    shp = list(H.shape)
+    lead = shp[:axis]
+    rest = shp[axis + 1:]
+    L, R = int(np.prod(lead)), int(np.prod(rest))
+    tiled = FFT_STRATEGY == "transpose"
+    # T1: (L, n1, n2, R) -> (L, n2, R, n1), k1 unit-stride
+    if tiled:
+        Y = _tiled_permute(H, (L, n2, R, n1), (n1 * n2 * R, R, 1, n2 * R))
+    else:
+        nl = len(lead)
+        Hv = H.reshape(*lead, n1, n2, *rest)
+        nd = Hv.ndim
+        # axes ids: lead 0..nl-1, n1 at nl, n2 at nl+1, rest nl+2..nd-1
+        p1 = list(range(nl)) + [nl + 1] + list(range(nl + 2, nd)) + [nl]
+        Y = mx.contiguous(mx.transpose(Hv, p1)).reshape(L, n2, R, n1)
+    A = fft1(Y, axis=-1)                             # k1 -> f1
+    del Y
+    # twiddle (k2, f1), then T2: (L, n2, R, f1) -> (L, f1, R, n2)
+    s2 = (n2 * R * n1, 1, n1, R * n1)
+    if _FOUR_STEP_FUSED_TWIDDLE:
+        Y2 = _tiled_permute(A, (L, n1, R, n2), s2, T, (0, 1, 0, n1))
+    else:
+        A = A * T.reshape(1, n2, 1, n1)
+        Y2 = (_tiled_permute(A, (L, n1, R, n2), s2) if tiled
+              else mx.contiguous(mx.transpose(A, (0, 3, 2, 1))))
+    del A
+    C = fft1(Y2, axis=-1)                            # k2 -> f2
+    del Y2
+    if scrambled:
+        # scrambled: axis stored as (f1, f2) blocks = f1*n2 + f2
+        return C.reshape(*lead, n, *rest), (n1, n2)
+    # T3: (L, f1, R, f2) -> (L, f2, f1, R) -> reshape (L, n, R)
+    if tiled:
+        X = _tiled_permute(C, (L, n2, n1, R), (n1 * R * n2, 1, R * n2, n2))
+    else:
+        X = mx.contiguous(mx.transpose(C, (0, 3, 1, 2)))
+    del C
+    return X.reshape(*lead, n, *rest)
+
+
 def fft_axis(H, axis, inverse, twiddle_cache=None):
     """(i)FFT along one axis; four-step Cooley-Tukey for long non-pow2 axes.
 
@@ -125,47 +426,18 @@ def fft_axis(H, axis, inverse, twiddle_cache=None):
       twiddle (k2, f1)
       T2: (L, f1, R, n2) -> FFT last (k2->f2)
       T3: (L, f2, f1, R) -> reshape (L, n, R)
+
+    Short axes (<= _SMALL_AXIS_DFT) take the dense DFT kernel instead of an
+    FFT launch; native non-last axes go to mx.fft directly (see the module
+    switches above; fft_grid_stages is the layout-aware whole-grid chain).
     """
+    axis = axis % H.ndim
     n = H.shape[axis]
-    fft1 = mx.fft.ifft if inverse else mx.fft.fft
-    if n <= _FFT_NATIVE_MAX or ((n & (n - 1)) == 0 and n <= _FFT_POW2_MAX):
-        return fft1(H, axis=axis)
-    n1, n2 = _split_n(n)
-    sgn = +1.0 if inverse else -1.0
-    key = (n, sgn)
-    if twiddle_cache is not None and key in twiddle_cache:
-        T = twiddle_cache[key]
-    else:
-        k2 = np.arange(n2, dtype=np.float64)[:, None]
-        f1 = np.arange(n1, dtype=np.float64)[None, :]
-        T = mx.array(np.exp(sgn * 2j * PI * f1 * k2 / n).astype(np.complex64))
-        if twiddle_cache is not None:
-            twiddle_cache[key] = T
-    shp = list(H.shape)
-    lead = shp[:axis]
-    rest = shp[axis + 1:]
-    nl = len(lead)
-    Hv = H.reshape(*lead, n1, n2, *rest)
-    nd = Hv.ndim
-    # axes ids: lead 0..nl-1, n1 at nl, n2 at nl+1, rest nl+2..nd-1
-    p1 = list(range(nl)) + [nl + 1] + list(range(nl + 2, nd)) + [nl]
-    Y = mx.contiguous(mx.transpose(Hv, p1))          # (L, n2, R, n1)
-    A = fft1(Y, axis=-1)                             # k1 -> f1
-    del Y
-    tshape = [1] * nl + [n2] + [1] * len(rest) + [n1]
-    B = A * T.reshape(tshape)
-    del A
-    # (L, n2, R, f1) -> (L, f1, R, n2)
-    p2 = list(range(nl)) + [nd - 1] + list(range(nl + 1, nd - 1)) + [nl]
-    Y2 = mx.contiguous(mx.transpose(B, p2))          # (L, f1, R, n2)
-    del B
-    C = fft1(Y2, axis=-1)                            # k2 -> f2
-    del Y2
-    # (L, f1, R, f2) -> (L, f2, f1, R) -> reshape (L, n, R)
-    p3 = list(range(nl)) + [nd - 1, nl] + list(range(nl + 1, nd - 1))
-    X = mx.contiguous(mx.transpose(C, p3)).reshape(*lead, n, *rest)
-    del C
-    return X
+    if _small_dft_ok(n, axis == H.ndim - 1):
+        return _dft_small(H, axis, inverse, twiddle_cache)
+    if _is_native(n):
+        return (mx.fft.ifft if inverse else mx.fft.fft)(H, axis=axis)
+    return _four_step(H, axis, inverse, twiddle_cache, scrambled=False)
 
 
 def fft_axis_scrambled(H, axis, inverse, twiddle_cache=None):
@@ -180,43 +452,81 @@ def fft_axis_scrambled(H, axis, inverse, twiddle_cache=None):
     if axis != H.ndim - 1 and axis != -1:
         raise ValueError("fft_axis_scrambled requires the last axis "
                          "(scramble is only separable there)")
+    axis = H.ndim - 1
     n = H.shape[axis]
+    if _small_dft_ok(n, True):
+        return _dft_small(H, axis, inverse, twiddle_cache), (1, n)
+    if _is_native(n):
+        return (mx.fft.ifft if inverse else mx.fft.fft)(H, axis=axis), (1, n)
+    return _four_step(H, axis, inverse, twiddle_cache, scrambled=True)
+
+
+def _move_axes(X, order, new_order):
+    """Re-lay the row-contiguous grid X, whose physical dims hold the logical
+    axes `order`, into the dim sequence `new_order` (one tiled pass)."""
+    if list(order) == list(new_order):
+        return X
+    ps = _row_strides(X.shape)
+    shape = tuple(X.shape[order.index(a)] for a in new_order)
+    ins = tuple(ps[order.index(a)] for a in new_order)
+    return _tiled_permute(X, shape, ins)
+
+
+def fft_grid_stages(H, inverse, twiddle_cache=None, eager=False):
+    """Full N-D (i)FFT of the row-contiguous grid H as a generator yielding
+    (axis, array) once per axis, last axis first (the v0.2.0 order); the last
+    array is the complete transform in natural, row-contiguous order. The
+    type-3 execute evaluates (and trims) at every yield; with eager the
+    generator also evaluates after every op inside a stage (MLX keeps every
+    intermediate of one eval alive until it completes, so a move + FFT +
+    move stage would otherwise peak at 4 grids; eager holds 3, the same as
+    the strided chain's input + internal copy + output).
+
+    FFT_STRATEGY "strided": fft_axis per axis, the v0.2.0 chain (MLX handles
+    a non-last axis with an internal strided copy and leaves the result in
+    that permuted layout; the consumer's view pays the copy back).
+    "transpose": every library FFT runs on the last axis. A short axis (see
+    _SMALL_AXIS_DFT) is transformed in place by the dense DFT and a long one
+    by the four-step at its current position (both keep the layout); any
+    other non-last axis is brought last by one tiled transpose, and a final
+    tiled transpose restores natural order once axis 0 is done. On a 3D
+    grid of native lengths that is 3 FFT passes plus 3 coalesced layout
+    passes (12 grid-sizes of traffic) against "strided"'s 3 FFT passes, 2
+    one-sided-scattered internal copies and the consumer's copy back.
+    """
+    d = H.ndim
+    if FFT_STRATEGY != "transpose":
+        for ax in range(d - 1, -1, -1):
+            H = fft_axis(H, ax, inverse, twiddle_cache)
+            yield ax, H
+        return
+
     fft1 = mx.fft.ifft if inverse else mx.fft.fft
-    if n <= _FFT_NATIVE_MAX or ((n & (n - 1)) == 0 and n <= _FFT_POW2_MAX):
-        return fft1(H, axis=axis), (1, n)
-    n1, n2 = _split_n(n)
-    sgn = +1.0 if inverse else -1.0
-    key = (n, sgn)
-    if twiddle_cache is not None and key in twiddle_cache:
-        T = twiddle_cache[key]
-    else:
-        k2 = np.arange(n2, dtype=np.float64)[:, None]
-        f1 = np.arange(n1, dtype=np.float64)[None, :]
-        T = mx.array(np.exp(sgn * 2j * PI * f1 * k2 / n).astype(np.complex64))
-        if twiddle_cache is not None:
-            twiddle_cache[key] = T
-    shp = list(H.shape)
-    lead = shp[:axis]
-    rest = shp[axis + 1:]
-    nl = len(lead)
-    Hv = H.reshape(*lead, n1, n2, *rest)
-    nd = Hv.ndim
-    p1 = list(range(nl)) + [nl + 1] + list(range(nl + 2, nd)) + [nl]
-    Y = mx.contiguous(mx.transpose(Hv, p1))          # (L, n2, R, n1)
-    A = fft1(Y, axis=-1)                             # k1 -> f1
-    del Y
-    tshape = [1] * nl + [n2] + [1] * len(rest) + [n1]
-    B = A * T.reshape(tshape)
-    del A
-    p2 = list(range(nl)) + [nd - 1] + list(range(nl + 1, nd - 1)) + [nl]
-    Y2 = mx.contiguous(mx.transpose(B, p2))          # (L, f1, R, n2)
-    del B
-    C = fft1(Y2, axis=-1)                            # k2 -> f2
-    del Y2
-    # scrambled: axis stored as (f1, f2) blocks = f1*n2 + f2
-    X = C.reshape(*lead, n, *rest)
-    del C
-    return X, (n1, n2)
+    natural = list(range(d))
+    order = list(natural)          # logical axis held by each physical dim
+    X, H = H, None
+    for ax in range(d - 1, -1, -1):
+        pos = order.index(ax)
+        n = X.shape[pos]
+        last = pos == d - 1
+        if _small_dft_ok(n, last):
+            X = _dft_small(X, pos, inverse, twiddle_cache)
+        elif not _is_native(n):
+            X = _four_step(X, pos, inverse, twiddle_cache, scrambled=False)
+        else:
+            if not last:
+                new = [o for o in order if o != ax] + [ax]
+                X = _move_axes(X, order, new)
+                order = new
+                if eager:
+                    mx.eval(X)
+            X = fft1(X, axis=-1)
+        if ax == 0 and order != natural:
+            if eager:
+                mx.eval(X)
+            X = _move_axes(X, order, natural)
+            order = natural
+        yield ax, X
 
 
 _DF64_HDR = """
@@ -1614,9 +1924,9 @@ class GpuT3Plan:
             H = self._fft3_vkfft(H)
         else:
             # axis-by-axis keeps peak memory at ~2x the inner grid
-            for ax in (2, 1, 0):
-                H = fft_axis(H, ax, inverse=self.isign > 0,
-                             twiddle_cache=self._twiddles)
+            chain = fft_grid_stages(H, self.isign > 0, self._twiddles)
+            for _ax, H in chain:
+                pass
         vf = mx.view(H, dtype=mx.float32).reshape(-1)
         yield "fft", vf
 
@@ -1730,17 +2040,7 @@ class GpuT3Plan:
     def _twiddle_arr(self, n, inverse):
         """Four-step twiddle table T[k2, f1] for length n; shares the
         (n, sgn)-keyed cache with fft_axis (identical construction)."""
-        n1, n2 = _split_n(n)
-        sgn = +1.0 if inverse else -1.0
-        key = (n, sgn)
-        T = self._twiddles.get(key)
-        if T is None:
-            k2 = np.arange(n2, dtype=np.float64)[:, None]
-            f1 = np.arange(n1, dtype=np.float64)[None, :]
-            T = mx.array(np.exp(sgn * 2j * PI * f1 * k2 / n)
-                         .astype(np.complex64))
-            self._twiddles[key] = T
-        return T
+        return _twiddle_table(n, inverse, self._twiddles)
 
     def _lateral_fft_block(self, Z, nb=1):
         """Whole-block lateral FFT for the full-Z fast path, ~9 grid passes
@@ -2018,10 +2318,10 @@ class GpuT3Plan:
         if self._vkfft_fft3:
             H = self._fft3_vkfft(H)
         else:
-            for ax in (2, 1, 0):
-                Hn = fft_axis(H, ax, inverse=self.isign > 0,
-                              twiddle_cache=self._twiddles)
-                del H
+            # one eval per axis (and per op inside a stage, eager) keeps the
+            # peak at ~3 inner grids whichever FFT_STRATEGY is in force
+            for _ax, Hn in fft_grid_stages(H, self.isign > 0, self._twiddles,
+                                           eager=True):
                 H = Hn
                 del Hn
                 mx.eval(H)
