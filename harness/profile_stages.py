@@ -13,6 +13,21 @@ separately (same warm-up and rep count) and the sum of the stage medians is
 reported against it (sum/whole), so the pipelining lost to the per-stage
 syncs stays visible. The staged output is also checked against execute()'s.
 
+A calibration timing brackets the run: a fixed pure-MLX workload (6 passes
+of mx.fft.fft along the rows of a fixed 1024x4096 complex64 array, 2^22
+elements, an elementwise multiply by a fixed unit-modulus array and
+mx.fft.ifft; about 3 ms on an M5 Max) is timed with the whole-execute
+protocol once before the first case and once after the last. No change to
+mlx_nufft can move it, so it is the reference for comparing runs across
+sessions: an M1 Mac mini re-timing identical code drifted between GPU
+performance states by up to 25 percent over tens of minutes (every stage
+together, FFT included; idle, on AC power, no thermal warning), while runs a
+few minutes apart agreed within 3 percent; an M5 Max holds 1 to 3 percent.
+calib_ms_start, calib_ms_end and their ratio go in the JSON meta and the
+markdown header, and a WARNING is printed when they differ by more than 5
+percent (the run spans a performance-state change: repeat it). --calib-only
+runs just the calibration, to compare two sessions before an A/B.
+
 Matrix (n_trans=1, default options, fixed seed, complex64 inputs):
   types 1 and 2: 1D N=2^20, 2D 512^2, 3D 128^3 and 256^3, M=1e6 points
                  uniform on [-pi, pi)^d
@@ -31,6 +46,7 @@ download of the result; both are part of execute()):
 
 Usage: profile_stages.py [--reps 7] [--warm 2] [--wake-ms 100]
                          [--cases id[,id..]] [--list] [--tag profile_baseline]
+       profile_stages.py --calib-only   (calibration timing only, printed)
        profile_stages.py --render results/<tag>.json   (markdown only)
 Writes results/<tag>.json and results/<tag>.md. results/ is gitignored: copy
 the .md to harness/PROFILE_BASELINE_<version>.md to keep a baseline with the
@@ -64,6 +80,14 @@ SEED = 0
 EPS_LIST = (1e-3, 1e-5)
 FLAG_TOL = 0.15          # |sum/whole - 1| above this is flagged in the table
 WAKE_MS = 100.0          # GPU busy burst before each timed set (0 disables)
+CALIB_SHAPE = (1024, 4096)  # calibration array: 2^22 complex64 as row FFTs of
+                            # 4096 (one 1D FFT of 2^22 is beyond mx.fft.fft)
+CALIB_PASSES = 6         # fft, multiply, ifft rounds per calibration rep
+CALIB_TOL = 0.05         # |end/start - 1| above this is a WARNING
+CALIB_DESC = (f"{CALIB_PASSES} passes of mx.fft.fft along the rows of a fixed "
+              f"{CALIB_SHAPE[0]}x{CALIB_SHAPE[1]} complex64 array, an "
+              "elementwise multiply by a fixed unit-modulus array and "
+              "mx.fft.ifft")
 
 # one entry per geometry; each runs at every eps in EPS_LIST
 CASES = [
@@ -335,6 +359,56 @@ def sync_floor(n=50):
     return statistics.median(ts)
 
 
+def calib_workload():
+    """One rep of the calibration workload as a closure over fixed inputs:
+    CALIB_PASSES rounds of mx.fft.fft along the rows of a seeded
+    CALIB_SHAPE complex64 array, a multiply by a fixed unit-modulus array
+    (keeps the values bounded across passes) and mx.fft.ifft. Pure MLX, so
+    no change to mlx_nufft can move its time."""
+    rng = np.random.default_rng(SEED)
+    n = int(np.prod(CALIB_SHAPE))
+    a = mx.array((rng.standard_normal(n) + 1j * rng.standard_normal(n)
+                  ).astype(np.complex64).reshape(CALIB_SHAPE))
+    b = mx.array(np.exp(1j * np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+                        ).astype(np.complex64).reshape(CALIB_SHAPE))
+    mx.eval(a, b)
+
+    def run():
+        h = a
+        for _ in range(CALIB_PASSES):
+            h = mx.fft.ifft(mx.fft.fft(h, axis=-1) * b, axis=-1)
+        return h
+    return run
+
+
+def time_calib(reps, warm, wake_ms):
+    """Rep times (s) of the calibration workload under the whole-execute
+    protocol: wake burst, warm-ups, reps with synchronize around each, one
+    re-run on an outlier. The median moves only with the GPU's performance
+    state (and the MLX version): taken before the first case and after the
+    last it brackets a run, and on its own (--calib-only) it compares
+    sessions."""
+    run = calib_workload()
+    gpu_wake(wake_ms)
+    for _ in range(warm):
+        mx.eval(run())
+
+    def loop():
+        ts = []
+        for _ in range(reps):
+            mx.synchronize()
+            t0 = time.perf_counter()
+            mx.eval(run())
+            mx.synchronize()
+            ts.append(time.perf_counter() - t0)
+        return ts
+
+    ts = loop()
+    if _outlier(ts):                # same rule as the stages
+        ts = loop()
+    return ts
+
+
 def time_whole(plan, inp, reps, warm, wake_ms):
     gpu_wake(wake_ms)
     for _ in range(warm):
@@ -472,6 +546,25 @@ def _fmt_ms(v):
     return f"{v:.2f}" if v < 100 else f"{v:.1f}"
 
 
+def _calib_line(m):
+    """Markdown header line for a run's start/end calibration (a JSON from
+    before the calibration was added renders as not recorded)."""
+    if "calib_ms_start" not in m:
+        return "- calibration: not recorded (run predates the calibration)"
+    r = m["calib_ratio"]
+    drift = 100.0 * abs(r - 1.0)
+    tol = 100.0 * m.get("calib_tol", CALIB_TOL)
+    warn = (f" WARNING: start and end differ by {drift:.1f}% (more than "
+            f"{tol:.0f}%): the run spans a GPU performance-state change and "
+            "should be repeated" if drift > tol else "")
+    return (f"- calibration: {_fmt_ms(m['calib_ms_start'])} ms at start, "
+            f"{_fmt_ms(m['calib_ms_end'])} ms at end, end/start {r:.3f} "
+            f"({m['calib_workload']}; timed with the whole-execute protocol "
+            "before the first case and after the last; pure MLX, so library "
+            "changes cannot move it and it is the reference for comparing "
+            f"runs across sessions){warn}")
+
+
 def to_markdown(doc):
     m = doc["meta"]
     out = [f"# Per-stage execute profile: mlx-nufft {m['mlx_nufft_version']}",
@@ -481,6 +574,7 @@ def to_markdown(doc):
            f"- git {m['git']['sha'][:12]} ({m['git']['branch']}"
            f"{', dirty' if m['git']['dirty'] else ''})",
            f"- run: {m['timestamp']}",
+           _calib_line(m),
            f"- type-2 pad path: {m.get('pad_path', 'v020')} (nd.PAD_PATH)",
            f"- protocol: per measurement, the GPU is kept busy for "
            f"{m['wake_ms']:.0f} ms (matmul loop) so the clocks are at steady "
@@ -498,7 +592,15 @@ def to_markdown(doc):
            f"Measured stage-boundary floor: {m['sync_floor_s'] * 1e3:.3f} ms "
            "per eval + synchronize; for flagged rows the Reading section "
            "puts the excess next to the cost of the stage boundaries at "
-           "that floor.",
+           "that floor. The calibration line times a fixed pure-MLX "
+           "workload with this same protocol before the first case and "
+           "after the last: no library change can move it, so it is the "
+           "reference for comparing runs across sessions (some Apple GPUs, "
+           "the M1 Mac mini measured, drift between performance states by "
+           "up to 25% over tens of minutes, every stage together), and "
+           "start and end differing by more than "
+           f"{100 * m.get('calib_tol', CALIB_TOL):.0f}% means the run spans "
+           "a performance-state change and should be repeated.",
            "- inputs: n_trans=1, complex64, fixed seed, default plan "
            "options (upsampfac auto for types 1/2: nd.py's policy takes "
            "sigma=1.25 on 3D grids of at least 2^15 modes at loose eps and "
@@ -611,6 +713,14 @@ def main(argv):
         warm = int(args[args.index("--warm") + 1])
     if "--wake-ms" in args:
         wake_ms = float(args[args.index("--wake-ms") + 1])
+    if "--calib-only" in args:      # calibration alone, to compare sessions
+        ts = time_calib(reps, warm, wake_ms)
+        print(f"machine: {machine()}\nmlx {mx.__version__}  mlx_nufft "
+              f"{mlx_nufft.__version__}  git {git_info()['sha'][:12]}  "
+              f"reps={reps} warm={warm} wake {wake_ms:.0f} ms")
+        print(f"calib {_fmt_ms(statistics.median(ts) * 1e3)} ms median, "
+              f"{_fmt_ms(min(ts) * 1e3)} ms min  ({CALIB_DESC})")
+        return
     if "--tag" in args:
         tag = args[args.index("--tag") + 1]
     if "--cases" in args:
@@ -626,15 +736,23 @@ def main(argv):
                     timespec="seconds"),
                 reps=reps, warm=warm, wake_ms=wake_ms, seed=SEED,
                 eps=list(EPS_LIST), sync_floor_s=sync_floor(),
-                pad_path=nd.PAD_PATH)
+                pad_path=nd.PAD_PATH, calib_workload=CALIB_DESC,
+                calib_tol=CALIB_TOL)
     print(f"machine: {meta['machine']}\nmlx {meta['mlx_version']}  "
           f"mlx_nufft {meta['mlx_nufft_version']}  git {meta['git']['sha'][:12]}"
           f"  reps={reps} warm={warm}  sync floor "
           f"{meta['sync_floor_s'] * 1e3:.3f} ms  pad path {meta['pad_path']}",
           flush=True)
 
-    rows = []
     t_start = time.perf_counter()
+    # calibration before the first case and after the last (whole-execute
+    # protocol): the cross-session reference and the drift check
+    meta["calib_ms_start"] = statistics.median(
+        time_calib(reps, warm, wake_ms)) * 1e3
+    print(f"calib start {_fmt_ms(meta['calib_ms_start'])} ms  "
+          f"({CALIB_DESC})", flush=True)
+
+    rows = []
     for spec in specs:
         for eps in EPS_LIST:
             t0 = time.perf_counter()
@@ -649,6 +767,18 @@ def main(argv):
                   f"{_fmt_ms(row['whole_ms']['min'])} ms  sum/whole "
                   f"{'n/a' if ratio is None else f'{ratio:.2f}'}  "
                   f"({time.perf_counter() - t0:.0f}s)\n    {st}", flush=True)
+    meta["calib_ms_end"] = statistics.median(
+        time_calib(reps, warm, wake_ms)) * 1e3
+    meta["calib_ratio"] = meta["calib_ms_end"] / meta["calib_ms_start"]
+    drift = abs(meta["calib_ratio"] - 1.0)
+    print(f"calib end {_fmt_ms(meta['calib_ms_end'])} ms  end/start "
+          f"{meta['calib_ratio']:.3f}", flush=True)
+    if drift > CALIB_TOL:
+        print(f"WARNING: calibration differs by {100 * drift:.1f}% between "
+              f"start and end ({_fmt_ms(meta['calib_ms_start'])} -> "
+              f"{_fmt_ms(meta['calib_ms_end'])} ms, more than "
+              f"{100 * CALIB_TOL:.0f}%): the run spans a GPU "
+              "performance-state change; repeat it", flush=True)
     doc = dict(meta=meta, cases=rows)
     doc["meta"]["wall_s"] = time.perf_counter() - t_start
 

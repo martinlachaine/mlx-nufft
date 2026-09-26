@@ -53,8 +53,15 @@ Measure before and after with the per-stage profiler, on an otherwise idle GPU:
 
 It reports the median of 7 warm runs per stage and writes `results/<tag>.md`;
 the tables committed as `harness/PROFILE_*.md` are the reference points for
-each release. A performance change should come with a way to compare both
-paths in one build (a module switch or one of the environment overrides
+each release. A/B runs must be taken within a few minutes of each other,
+interleaved when possible, because some Apple GPUs (the M1 Mac mini measured)
+drift between performance states by up to 25 percent over tens of minutes.
+The profiler's calibration timing (`--calib-only` runs it alone) is the
+cross-session reference, and a run whose start and end calibration differ by
+more than 5 percent should be repeated.
+
+A performance change should come with a way to compare both paths in one
+build (a module switch or one of the environment overrides
 `MLX_NUFFT_FFT_STRATEGY`, `MLX_NUFFT_PAD_PATH`, `MLX_NUFFT_UPSAMPFAC`) and with
 a test that pins the outputs: bit-identical for pure data-movement changes,
 within the existing CPU-reference tolerances otherwise. Changes that measure
