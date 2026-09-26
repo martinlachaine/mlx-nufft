@@ -585,12 +585,14 @@ class Type1PlanND(_PointsND):
         es = _es_msl("k1", w, self.beta)
 
         assert spread_method in ("auto", "od", "gm")
-        # OD pays when the tap count keeps a 256-thread group busy (w >= 5);
-        # at w <= 4 the direct atomic spread is equally fast and simpler.
+        # OD pays from w = 4 up: measured against the direct atomic spread at
+        # w = 4 (eps 1e-3, sigma 2), M5 Max 1.13x to 1.85x and M1 1.88x on 2D
+        # and 3D 128^3 with random and clustered points, the one exception
+        # 3D 256^3 random at 0.95x. At w <= 3 the direct spread stays.
         # Preference order: exclusive-ownership OD (no global atomics, no
         # output zero-init) -> padded-tile OD -> GM.
         want_od = (spread_method == "od"
-                   or (spread_method == "auto" and w >= 5))
+                   or (spread_method == "auto" and w >= 4))
         modx = self._odx_dims() if (want_od and dim == 1) else None
         self._od_ex = False
         if modx is not None:

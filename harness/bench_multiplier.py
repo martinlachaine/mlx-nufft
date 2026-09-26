@@ -76,10 +76,9 @@ def bench(dim, ntype, N, eps, dist, rho, ram_gb, prob, seed=11):
         mx.synchronize(); t0 = time.perf_counter(); out = run(); mx.synchronize()
         ts.append(time.perf_counter() - t0)
     t_gpu = min(ts)
+    # every type-2 path returns caller order (the cell-sorted gather writes
+    # out[perm[kk]]); un-permuting here double-scrambled the type-2 rows
     out_g = np.asarray(out)
-    if ntype == 2 and gp.sorted and not gp._od:
-        inv = np.empty_like(gp.perm); inv[gp.perm] = np.arange(gp.P)
-        out_g = out_g[inv]
     err_gpu = rel_l2(out_g.ravel(), ref)
     del gp, data_g, out; mx.clear_cache()
 

@@ -69,6 +69,12 @@ def watchdog(limit_gib=None):
         time.sleep(0.5)
 
 
+def machine_ram_gib():
+    import subprocess as _sp
+    return int(_sp.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                       text=True).stdout) / 2**30
+
+
 def cpu_pred_gib(x, s, eps, sigma=1.25):
     """Predicted CPU fp64 FINUFFT t3 grid memory (complex128, both levels)."""
     w, _ = kernel_params(eps, sigma)
@@ -127,7 +133,10 @@ def run_config(geom, N, P):
     mx.clear_cache()
 
     pred = cpu_pred_gib(x, s, eps)
-    if pred < 9.0:
+    # run the fp64 CPU oracle when its predicted grids fit in half of RAM
+    # (9 GiB was the 16 GB mini's number; a 128 GB machine can afford the
+    # anisotropic cases' ~13 GiB and gets their CPU timings)
+    if pred < 0.5 * machine_ram_gib():
         ts_c = []
         f_cpu = None
         for _ in range(2):
