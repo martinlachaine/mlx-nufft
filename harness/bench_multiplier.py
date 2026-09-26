@@ -8,7 +8,8 @@ analogue). Achieved error is measured against a tight fp64 CPU reference
 
 Protocol: "exec" timing only (plan + setpts excluded on both arms); single
 precision both arms; GPU data device-resident (unified memory, no transfer).
-GPU = min of 3 warm executes, CPU = min of 2.
+GPU = 100 ms wake burst, 3 warm executes, then the median of 7; CPU = one
+warm execute, then the median of 5.
 
 Usage: bench_multiplier.py [--quick] [--rho]
 Writes results/multiplier.json.
@@ -20,6 +21,8 @@ import time
 import pathlib
 import platform
 import subprocess
+
+import statistics
 
 import numpy as np
 import mlx.core as mx
@@ -59,36 +62,60 @@ def build_problem(dim, ntype, N, dist, rho, ram_gb, seed=11):
     return dict(Nt=Nt, x=x, M=M, data=data, isign=isign, ref=ref)
 
 
+GPU_WAKE_MS = 100
+GPU_WARM = 3
+GPU_REPS = 7
+CPU_REPS = 5
+
+
+def gpu_wake(ms):
+    """Keep the GPU busy for ~ms so the timed runs start at steady clocks
+    (the same burst harness/profile_stages.py uses)."""
+    a = mx.ones((2048, 2048), dtype=mx.float32)
+    t0 = time.perf_counter()
+    while (time.perf_counter() - t0) * 1e3 < ms:
+        mx.eval(a @ a)
+    mx.synchronize()
+
+
 def bench(dim, ntype, N, eps, dist, rho, ram_gb, prob, seed=11):
     Nt, x, M = prob["Nt"], prob["x"], prob["M"]
     data, isign, ref = prob["data"], prob["isign"], prob["ref"]
 
-    # GPU arm (exec only; device-resident; min of 3)
+    # GPU arm (exec only; device-resident). The CPU reference and CPU arm
+    # leave the GPU idle for seconds, and a sub-millisecond 1D execute ends
+    # before the clocks recover, so whole sweeps could land 2x to 3x slow:
+    # a 100 ms wake burst and three warm runs first, then the median of 7.
     data_g = mx.array(data); mx.eval(data_g)
     if ntype == 1:
         gp = gpu.Type1PlanND(tuple(x), Nt, eps=eps, isign=isign)
     else:
         gp = gpu.Type2PlanND(tuple(x), Nt, eps=eps, isign=isign)
     run = lambda: gp.execute(data_g, return_np=False)        # noqa: E731
-    out = run()
+    gpu_wake(GPU_WAKE_MS)
+    for _ in range(GPU_WARM):
+        out = run()
+    mx.synchronize()
     ts = []
-    for _ in range(3):
+    for _ in range(GPU_REPS):
         mx.synchronize(); t0 = time.perf_counter(); out = run(); mx.synchronize()
         ts.append(time.perf_counter() - t0)
-    t_gpu = min(ts)
+    t_gpu = statistics.median(ts)
     # every type-2 path returns caller order (the cell-sorted gather writes
     # out[perm[kk]]); un-permuting here double-scrambled the type-2 rows
     out_g = np.asarray(out)
     err_gpu = rel_l2(out_g.ravel(), ref)
     del gp, data_g, out; mx.clear_cache()
 
-    # CPU fp32 arm (exec only; min of 2)
+    # CPU fp32 arm (exec only; one warm run, then the median of 5: the
+    # multithreaded CPU baseline varies about 10 percent run to run)
     cp = cpu.Plan(ntype, Nt, eps=eps, isign=isign, dtype="complex64")
     cp.setpts(*[v.astype(np.float32) for v in x])
+    out_c = cp.execute(data)
     ts_c = []
-    for _ in range(2):
+    for _ in range(CPU_REPS):
         t0 = time.perf_counter(); out_c = cp.execute(data); ts_c.append(time.perf_counter() - t0)
-    t_cpu = min(ts_c)
+    t_cpu = statistics.median(ts_c)
     err_cpu = rel_l2(np.asarray(out_c).ravel(), ref)
 
     return dict(dim=dim, type=ntype, N=N, M=M, eps=eps, dist=dist, rho=rho,
@@ -143,7 +170,9 @@ if __name__ == "__main__":
                 rows.append(r)
 
     out = dict(machine=mstr, protocol="exec-only, fp32 both arms, "
-               f"ref fp64 eps={REF_EPS:g}", ref_eps=REF_EPS, rows=rows)
+               f"GPU {GPU_WAKE_MS} ms wake + {GPU_WARM} warm + median of {GPU_REPS}, "
+               f"CPU 1 warm + median of {CPU_REPS}, ref fp64 eps={REF_EPS:g}",
+               ref_eps=REF_EPS, rows=rows)
     p = pathlib.Path(__file__).resolve().parents[1] / "results" / "multiplier.json"
     p.parent.mkdir(exist_ok=True)
     json.dump(out, open(p, "w"), indent=1)
