@@ -2,6 +2,7 @@
 
 ## v0.3.2 - 2026-09-26
 
+- The 3D upsampling default now accounts for point density, the points per cell of the sigma=2 grid. At high density the sigma=1.25 grid packs about four times more points per cell and spreading contends, so type 1 at eps=1e-3 ran 0.67x as fast as with sigma=2 at density 1 on an M5 Max. Type 1 now takes sigma=1.25 only below density 0.1, and type 2 at eps=1e-4 only below 0.3; type 2 at eps=1e-3 and looser keeps sigma=1.25 at every density, where it is 1.15x to 1.89x faster. Low-density plans, where the gains of v0.3.0 were measured, are unchanged.
 - Type-1 spreading uses the tile kernels at every kernel width, not only from width 4. With the direct atomic spread, clustered points at loose tolerances (eps of 1e-2 and looser) ran at 1.3 to 3.5 microseconds per point on an M1, about 600 times slower than CPU FINUFFT; on an M5 Max the tile kernels are 1.8x to 4.1x faster on clustered points at widths 2 and 3 and within 0.89x to 1.99x on random points. Plans with fewer than 20000 points keep the direct spread.
 - The reference pipeline used by `harness/diagnose_ref.py` chooses its kernel width by counting the axes that carry a full band, as the library's type-3 plan does, so the stage-level precision study measures the kernel the library uses.
 - `harness/run_acceptance.py` models the double-precision CPU reference with FINUFFT's own kernel width (`sizing.finufft_width`), which gives 15.4 GiB for the anisotropic case.

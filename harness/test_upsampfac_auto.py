@@ -79,7 +79,7 @@ def cplx(shape):
             ).astype(np.complex64)
 
 
-def rule(dim, typ, eps, n_modes):
+def rule(dim, typ, eps, n_modes, P=None):
     """The documented rule, stated independently of nd._resolve_upsampfac."""
     low, high = nd.UPSAMP_AUTO_LOW, nd.UPSAMP_AUTO_HIGH
     if dim < nd.UPSAMP_AUTO_MIN_DIM:
@@ -87,8 +87,14 @@ def rule(dim, typ, eps, n_modes):
     modes = int(np.prod(n_modes))
     if modes < nd.UPSAMP_AUTO_MIN_MODES:
         return high
+    rho = 0.0 if P is None else P / (2 ** dim * modes)
     if typ == 2:
-        return low if eps >= nd.UPSAMP_AUTO_EPS_T2 else high
+        if eps >= nd.UPSAMP_AUTO_EPS_T2_ANY_RHO:
+            return low
+        return low if (eps >= nd.UPSAMP_AUTO_EPS_T2
+                       and rho < nd.UPSAMP_AUTO_T2_MAX_RHO) else high
+    if rho >= nd.UPSAMP_AUTO_T1_MAX_RHO:
+        return high
     if eps >= nd.UPSAMP_AUTO_EPS_T1:
         return low
     if modes >= nd.UPSAMP_AUTO_T1_BIG_MODES:
@@ -364,6 +370,36 @@ def check_accuracy():
               f"rel_l2 t1={e1:.2e} t2={e2:.2e} (gate {thr:.1e})")
 
 
+def check_density():
+    print("== (e) point density limits the sigma=1.25 default ==")
+    check("shipped density constants",
+          (nd.UPSAMP_AUTO_T1_MAX_RHO, nd.UPSAMP_AUTO_EPS_T2_ANY_RHO,
+           nd.UPSAMP_AUTO_T2_MAX_RHO) == (0.1, 1e-3, 0.3),
+          "T1_MAX_RHO 0.1, EPS_T2_ANY_RHO 1e-3, T2_MAX_RHO 0.3")
+    bad = []
+    cells = 8 * int(np.prod(MID3))
+    for N in (MID3, BIG[3]):
+        cells = 8 * int(np.prod(N))
+        for rho in (0.0, 0.05, 0.099, 0.1, 0.2, 0.299, 0.3, 1.0):
+            P = int(round(rho * cells)) if rho else None
+            for typ in (1, 2):
+                for e in (1e-2, 1e-3, 1e-4, 1e-5):
+                    got = nd._resolve_upsampfac(None, 3, typ, e, N, P)[0]
+                    if got != rule(3, typ, e, N, P):
+                        bad.append((N, rho, typ, e, got))
+    check("resolver matches the density rule (2 grids x 8 densities x 2 types x 4 eps)",
+          not bad, f"mismatches {bad[:4]}")
+    cells = 8 * int(np.prod(MID3))
+    P_hi = int(0.36 * cells)
+    x = pts(3, P_hi)
+    for typ, e, want in ((1, 1e-3, nd.UPSAMP_AUTO_HIGH), (2, 1e-3, nd.UPSAMP_AUTO_LOW),
+                         (2, 1e-4, nd.UPSAMP_AUTO_HIGH)):
+        cls = nd.Type1PlanND if typ == 1 else nd.Type2PlanND
+        p = cls(x, MID3, eps=e, isign=+1)
+        check(f"plan t{typ} 3D {MID3} rho=0.36 eps={e:.0e} resolves {want}",
+              p.upsampfac == want, f"upsampfac={p.upsampfac}")
+
+
 if __name__ == "__main__":
     preset = os.environ.pop(nd.UPSAMP_ENV, None)
     if preset is not None:
@@ -373,5 +409,6 @@ if __name__ == "__main__":
     check_explicit_and_env()
     check_bits()
     check_accuracy()
+    check_density()
     print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURES: {FAILS}'}")
     sys.exit(0 if not FAILS else 1)

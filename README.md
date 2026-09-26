@@ -142,7 +142,9 @@ the bridge is built.
   complex128 inputs are accepted and returned but transformed at fp32 grade.
 - Types 1 and 2 in 3D default to upsampling factor 1.25 on grids of at least
   32768 modes when `eps` is 1e-4 or looser (type 2) or 1e-3 or looser (type 1,
-  and 1e-4 on grids of 2^24 modes or more). At eps=1e-3 this runs about 2x
+  and 1e-4 on grids of 2^24 modes or more), provided the points are sparse
+  enough: fewer than 0.1 per cell of the sigma-2 grid for type 1, and fewer
+  than 0.3 for type 2 at eps=1e-4. At low density this runs up to about 2x
   faster with an achieved error 1.5 to 1.7 times the sigma-2 result, in the
   same eps bracket. Pass `upsampfac=2.0` to keep the finufft default.
 - Type 3 runs at upsampling factor 1.25 with the kernel width capped at 8 on

@@ -76,7 +76,18 @@ PAD_PATH = os.environ.get("MLX_NUFFT_PAD_PATH", "fused")
 # grids land at 4.7e-3 against the harness gate of 4.2e-3 where 64^3
 # gives 3.8e-3 and 128^3 3.5e-3, so grids under UPSAMP_AUTO_MIN_MODES
 # modes keep 2.0 for both types. Where 1.25 is taken the error is 1.3x to
-# 1.6x sigma=2's at the same eps (the same eps grade). The environment
+# 1.6x sigma=2's at the same eps (the same eps grade). Point density rho,
+# the points per cell of the sigma=2 grid (P / (2^dim prod(N))), limits the
+# gain because the sigma=1.25 grid packs about four times more points per
+# cell and the spread contends. Measured on an M5 Max (v0.3.2 code, 3D
+# 96^3 to 192^3): type 1 at eps=1e-3 is 1.53x to 1.60x at rho=0.03 and
+# 1.10x to 1.45x at rho=0.1 but 0.95x to 0.96x at rho=0.15 on 128^3 and
+# larger and 0.67x at rho=1; type 2 at eps=1e-3 wins at every density
+# (1.15x to 1.89x); type 2 at eps=1e-4 is 1.26x to 1.38x at rho=0.2 and
+# 1.03x to 1.13x at rho=0.3 but 0.94x to 1.00x at rho=1. So type 1 takes
+# 1.25 only below UPSAMP_AUTO_T1_MAX_RHO, and type 2 below
+# UPSAMP_AUTO_EPS_T2_ANY_RHO only below UPSAMP_AUTO_T2_MAX_RHO. Callers
+# that pass no point count (P=None) get the low-density rule. The environment
 # variable MLX_NUFFT_UPSAMPFAC=auto|2.0|1.25 replaces the resolved default
 # (read when a plan resolves it; an explicit constructor argument wins
 # over it). The rule that fired is logged at DEBUG level.
@@ -86,15 +97,19 @@ UPSAMP_AUTO_EPS_T2 = 1e-4           # type 2: 1.25 at eps >= this
 UPSAMP_AUTO_EPS_T1 = 1e-3           # type 1: 1.25 at eps >= this, or
 UPSAMP_AUTO_EPS_T1_BIG = 1e-4       #   at eps >= this on a grid of
 UPSAMP_AUTO_T1_BIG_MODES = 2 ** 24  #   at least this many modes (256^3)
+UPSAMP_AUTO_T1_MAX_RHO = 0.1        # type 1: 1.25 only below this density
+UPSAMP_AUTO_EPS_T2_ANY_RHO = 1e-3   # type 2: 1.25 at any density from here;
+UPSAMP_AUTO_T2_MAX_RHO = 0.3        #   below it, only under this density
 UPSAMP_AUTO_LOW = 1.25
 UPSAMP_AUTO_HIGH = 2.0
 UPSAMP_ENV = "MLX_NUFFT_UPSAMPFAC"
 
 
-def _resolve_upsampfac(upsampfac, dim, nufft_type, eps, n_modes):
+def _resolve_upsampfac(upsampfac, dim, nufft_type, eps, n_modes, P=None):
     """(upsampfac, rule) for a plan: an explicit value as given (float);
     None, "auto" and finufft's 0 sentinel take MLX_NUFFT_UPSAMPFAC when it
-    names a value, else the policy above. rule names what decided."""
+    names a value, else the policy above, with P the number of nonuniform
+    points (None: low density). rule names what decided."""
     if upsampfac not in (None, "auto", 0, 0.0):
         return float(upsampfac), "explicit"
     env = os.environ.get(UPSAMP_ENV, "auto").strip().lower()
@@ -108,10 +123,17 @@ def _resolve_upsampfac(upsampfac, dim, nufft_type, eps, n_modes):
         return UPSAMP_AUTO_HIGH, "dim < UPSAMP_AUTO_MIN_DIM"
     if int(np.prod(n_modes)) < UPSAMP_AUTO_MIN_MODES:
         return UPSAMP_AUTO_HIGH, "prod(n_modes) < UPSAMP_AUTO_MIN_MODES"
+    rho = (0.0 if P is None
+           else float(P) / (2.0 ** dim * float(np.prod(n_modes))))
     if nufft_type == 2:
-        if eps >= UPSAMP_AUTO_EPS_T2:
-            return UPSAMP_AUTO_LOW, "type 2, eps >= UPSAMP_AUTO_EPS_T2"
-        return UPSAMP_AUTO_HIGH, "type 2, eps < UPSAMP_AUTO_EPS_T2"
+        if eps >= UPSAMP_AUTO_EPS_T2_ANY_RHO:
+            return UPSAMP_AUTO_LOW, "type 2, eps >= UPSAMP_AUTO_EPS_T2_ANY_RHO"
+        if eps >= UPSAMP_AUTO_EPS_T2 and rho < UPSAMP_AUTO_T2_MAX_RHO:
+            return UPSAMP_AUTO_LOW, ("type 2, eps >= UPSAMP_AUTO_EPS_T2, "
+                                     "rho < UPSAMP_AUTO_T2_MAX_RHO")
+        return UPSAMP_AUTO_HIGH, "type 2, eps or density above the thresholds"
+    if rho >= UPSAMP_AUTO_T1_MAX_RHO:
+        return UPSAMP_AUTO_HIGH, "type 1, rho >= UPSAMP_AUTO_T1_MAX_RHO"
     if eps >= UPSAMP_AUTO_EPS_T1:
         return UPSAMP_AUTO_LOW, "type 1, eps >= UPSAMP_AUTO_EPS_T1"
     if (eps >= UPSAMP_AUTO_EPS_T1_BIG
@@ -280,7 +302,8 @@ class _PointsND:
         if any(n < 1 for n in self.N):
             raise ValueError("mode dims must be >= 1")
         upsampfac, rule = _resolve_upsampfac(upsampfac, self.dim,
-                                             self._NUFFT_TYPE, eps, self.N)
+                                             self._NUFFT_TYPE, eps, self.N,
+                                             int(np.size(x[0])))
         _log.debug("%s N=%s eps=%g: upsampfac %g (%s)", type(self).__name__,
                    self.N, eps, upsampfac, rule)
         if not 1.0 < upsampfac <= 4.0:
