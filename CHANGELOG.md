@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.3.1 - 2026-09-25
+## v0.3.1 - 2026-09-26
 
 - Type-1 spreading uses the tile kernels from kernel width 4 instead of 5. Measured against the direct atomic spread at width 4: 1.1x to 1.9x on 2D and 3D 128^3 with random and clustered points on both an M5 Max and an M1, so it is a global default, not a device rule.
 - `harness/bench_multiplier.py` no longer un-permutes type-2 outputs, which every type-2 path already returns in caller order; its type-2 accuracy column read about 1.4 before. Found by the M1 run of the paper suite.
