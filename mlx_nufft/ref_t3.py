@@ -20,7 +20,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .sizing import kernel_params, kernel_ft, set_nhg_type3, next235even
+from .sizing import (kernel_params, kernel_ft, set_nhg_type3, next235even,
+                     full_band_axes)
 
 PI = np.pi
 
@@ -54,7 +55,12 @@ class RefT3Plan:
         self.eps = eps
         self.sigma = upsampfac
         self.chunk = chunk
-        self.w, self.beta = kernel_params(eps, upsampfac)
+        # same width rule as GpuT3Plan: the fp32 low-sigma cap depends on how
+        # many axes carry a full band, from the fp64 extents
+        X64 = [0.5 * float(np.ptp(np.asarray(xd, dtype=np.float64))) for xd in x]
+        S64 = [0.5 * float(np.ptp(np.asarray(sd, dtype=np.float64))) for sd in s]
+        self.nfull = full_band_axes(S64, X64)
+        self.w, self.beta = kernel_params(eps, upsampfac, self.nfull)
         w = self.w
 
         rdt = np.float64 if f.coords64 else np.float32

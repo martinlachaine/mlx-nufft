@@ -64,12 +64,7 @@ def kernel_params(eps: float, upsampfac: float, nfull=None):
     dimension; type 3: full_band_axes; None: unknown, takes the three-axis
     cap). beta = (beta/w)*w with the FINUFFT-tuned ratios.
     """
-    if upsampfac == 2.0:
-        ns = int(np.ceil(-np.log10(eps / 10.0)))
-    else:
-        ns = int(np.ceil(-np.log(eps) / (PI * np.sqrt(1.0 - 1.0 / upsampfac))))
-    ns = max(2, min(ns, 16))
-    ns = cap_kernel_width(ns, upsampfac, nfull)
+    ns = cap_kernel_width(finufft_width(eps, upsampfac), upsampfac, nfull)
     betaoverns = 2.30
     if ns == 2:
         betaoverns = 2.20
@@ -81,6 +76,18 @@ def kernel_params(eps: float, upsampfac: float, nfull=None):
         gamma = 0.97
         betaoverns = gamma * PI * (1.0 - 1.0 / (2.0 * upsampfac))
     return ns, betaoverns * ns
+
+
+def finufft_width(eps: float, upsampfac: float):
+    """FINUFFT's kernel width for tolerance eps, before the fp32 low-sigma
+    cap: w = ceil(log10(10/eps)) at sigma=2, the Liu lower-bound formula
+    otherwise, clamped to [2, 16]. This is the width double-precision
+    FINUFFT uses, so harness memory models of the CPU reference call it."""
+    if upsampfac == 2.0:
+        ns = int(np.ceil(-np.log10(eps / 10.0)))
+    else:
+        ns = int(np.ceil(-np.log(eps) / (PI * np.sqrt(1.0 - 1.0 / upsampfac))))
+    return max(2, min(ns, 16))
 
 
 def cap_kernel_width(ns, upsampfac, nfull=None):

@@ -30,7 +30,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[0].parent))
 from harness.gen import (gen_anisotropic, gen_generic, direct_sum_mp,   # noqa
                          direct_sum, rel_l2)
 from mlx_nufft import Type3Plan, Type1Plan, Type2Plan           # noqa
-from mlx_nufft.sizing import kernel_params, set_nhg_type3       # noqa
+from mlx_nufft.sizing import finufft_width, set_nhg_type3   # noqa
 
 RESDIR = pathlib.Path(__file__).resolve().parents[1] / "results"
 RESDIR.mkdir(exist_ok=True)
@@ -76,8 +76,9 @@ def machine_ram_gib():
 
 
 def cpu_pred_gib(x, s, eps, sigma=1.25):
-    """Predicted CPU fp64 FINUFFT t3 grid memory (complex128, both levels)."""
-    w, _ = kernel_params(eps, sigma)
+    """Predicted CPU fp64 FINUFFT t3 grid memory (complex128, both levels),
+    at the width double-precision FINUFFT uses (no fp32 low-sigma cap)."""
+    w = finufft_width(eps, sigma)
     spread, inner = 1.0, 1.0
     for d in range(3):
         X = 0.5 * (x[d].max() - x[d].min())

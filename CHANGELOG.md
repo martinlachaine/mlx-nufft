@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.2 - 2026-09-26
+
+- Type-1 spreading uses the tile kernels at every kernel width, not only from width 4. With the direct atomic spread, clustered points at loose tolerances (eps of 1e-2 and looser) ran at 1.3 to 3.5 microseconds per point on an M1, about 600 times slower than CPU FINUFFT; on an M5 Max the tile kernels are 1.8x to 4.1x faster on clustered points at widths 2 and 3 and within 0.89x to 1.99x on random points. Plans with fewer than 20000 points keep the direct spread.
+- The reference pipeline used by `harness/diagnose_ref.py` chooses its kernel width by counting the axes that carry a full band, as the library's type-3 plan does, so the stage-level precision study measures the kernel the library uses.
+- `harness/run_acceptance.py` models the double-precision CPU reference with FINUFFT's own kernel width (`sizing.finufft_width`), which gives 15.4 GiB for the anisotropic case.
+
 ## v0.3.1 - 2026-09-26
 
 - Type-1 spreading uses the tile kernels from kernel width 4 instead of 5. Measured against the direct atomic spread at width 4: 1.1x to 1.9x on 2D and 3D 128^3 with random and clustered points on both an M5 Max and an M1, so it is a global default, not a device rule.

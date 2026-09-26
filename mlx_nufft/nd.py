@@ -585,14 +585,15 @@ class Type1PlanND(_PointsND):
         es = _es_msl("k1", w, self.beta)
 
         assert spread_method in ("auto", "od", "gm")
-        # OD pays from w = 4 up: measured against the direct atomic spread at
-        # w = 4 (eps 1e-3, sigma 2), M5 Max 1.13x to 1.85x and M1 1.88x on 2D
-        # and 3D 128^3 with random and clustered points, the one exception
-        # 3D 256^3 random at 0.95x. At w <= 3 the direct spread stays.
-        # Preference order: exclusive-ownership OD (no global atomics, no
-        # output zero-init) -> padded-tile OD -> GM.
-        want_od = (spread_method == "od"
-                   or (spread_method == "auto" and w >= 4))
+        # OD at every width. Against the direct atomic spread (sigma 2, M5
+        # Max): clustered points 1.8x to 4.1x at w = 2 and 3 and 2.7x to 6.2x
+        # at w = 4; random points 0.89x to 1.99x at w = 2 and 3 and 1.13x to
+        # 1.85x at w = 4. On an M1 the direct spread serializes on clustered
+        # points (1.3 to 3.5 us per point at w <= 3, about 600x slower than
+        # CPU FINUFFT). Plans under 20000 points still take GM, since the OD
+        # prepare declines them. Preference order: exclusive-ownership OD (no
+        # global atomics, no output zero-init) -> padded-tile OD -> GM.
+        want_od = spread_method in ("od", "auto")
         modx = self._odx_dims() if (want_od and dim == 1) else None
         self._od_ex = False
         if modx is not None:
