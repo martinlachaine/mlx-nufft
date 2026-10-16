@@ -2,9 +2,9 @@
 
 ## v0.3.3 - 2026-10-16
 
-- Type-3 plans compute their target-side arrays (cell indices, offsets, and the phase-and-deconvolution factor per target) in chunks on a thread pool. The results are bit-identical to one pass (`harness/test_t3_plan_chunks.py`). On an M5 Max, a plan with 4.19M targets builds in 0.068 s instead of 0.213 s, which had been three times FINUFFT's own type-3 plan and the larger part of a one-shot transform.
-- `harness/run_acceptance.py`, which produces the paper's type-3 table, compares like with like. It divided a complete `nufft3d3` call, plan and sorting included, by the GPU execute alone; it now times FINUFFT through its plan interface. Both sides build and execute a plan three times and then execute the last plan three more times: `speedup` compares the repeated execute, and `speedup_total` plan construction plus a first execute. Peak memory is measured per configuration rather than as a running maximum over the run.
-- The memory watchdog in `harness/run_acceptance.py` and `harness/bench_gpu.py` reads the resident size in-process (`harness/memwatch.py`). It polled `ps` every 0.5 s, and each poll forked the benchmark process, which slowed the multithreaded CPU FINUFFT reference by about 50 percent (a 640^3 type-3 execute took 1.05 s instead of 0.70 s on an M5 Max) and left GPU times unchanged. Type-3 speedups measured before this release are therefore too high by up to that factor. The type-1/2 sweep (`harness/bench_multiplier.py`) never ran the watchdog.
+- Faster type-3 plan construction: the target-side setup runs on a thread pool, with bit-identical results. 4.19M targets on an M5 Max: 0.213 s to 0.068 s.
+- `harness/run_acceptance.py` times FINUFFT through its plan interface and reports execute-to-execute (`speedup`) and plan-plus-execute (`speedup_total`) speedups. Peak memory is measured per configuration.
+- The memory watchdog in `harness/run_acceptance.py` and `harness/bench_gpu.py` no longer forks `ps`, which slowed the CPU reference by about 50 percent.
 
 ## v0.3.2 - 2026-09-26
 
