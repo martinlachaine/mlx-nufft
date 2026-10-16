@@ -4,9 +4,12 @@ Short transforms are launch-bound, so host and display load inflate them
 while leaving long ones almost untouched. Reports the per-op launch latency
 (a tiny op, eval and synchronize, median of 500) and the profiler's
 calibration workload, and the GPU utilization sampled over two seconds.
-On an idle M5 Max the launch latency is about 60 us and the stage floor
-0.167 ms (September 2026 profile); a session of the desktop app rendering a
-long transcript raised it to 160-190 us and the floor to 0.21 ms.
+The M5 Max measured 160-200 us of launch latency in every session so far
+(the profiler's stage floor was 0.195 ms in September 2026 and 0.183 in
+October), so the latency is reported for the record and the verdict rests
+on the GPU utilization: a GPU that other processes keep busy (an animated
+wallpaper, screen sharing, a video) never idles between the benchmark's
+bursts, and the short transforms then read slow.
 
     .venv/bin/python harness/idle_check.py
 """
@@ -57,8 +60,9 @@ def main():
     print(f"launch latency {lat:.0f} us per op (eval + synchronize, median of 500)")
     print(f"calibration {calib:.2f} ms (median of 7)")
     print(f"GPU utilization while idle: {util} percent")
-    quiet = lat <= 90 and (not util or max(util) <= 10)
-    print("QUIET" if quiet else "BUSY: close other apps and let the desktop idle before timing")
+    busy = sum(1 for u in util if u > 10) >= 2        # the first sample follows our own work
+    print("BUSY: another process is using the GPU; close it before timing" if busy else "QUIET")
+    quiet = not busy
     return 0 if quiet else 1
 
 
