@@ -11,7 +11,6 @@ import platform
 import subprocess
 
 import os
-import threading
 import numpy as np
 import mlx.core as mx
 
@@ -46,25 +45,8 @@ if __name__ == "__main__":
 
     print(f"machine: {machine()}", flush=True)
 
-    def watchdog(limit_gib=None):
-        import subprocess as sp
-        import time as _t
-        if limit_gib is None:   # ~72% of machine RAM
-            ram = int(sp.run(["sysctl", "-n", "hw.memsize"],
-                             capture_output=True, text=True).stdout) / 2**30
-            limit_gib = max(11.5, 0.72 * ram)
-        pid = os.getpid()
-        while True:
-            rss = int(sp.run(["ps", "-o", "rss=", "-p", str(pid)],
-                             capture_output=True, text=True).stdout or 0)
-            gib = max(rss * 1024, mx.get_active_memory()) / 2**30
-            if gib > limit_gib:
-                print(f"WATCHDOG: {gib:.1f} GiB > {limit_gib} GiB"
-                      " — aborting to protect machine", flush=True)
-                os._exit(3)
-            _t.sleep(0.5)
-
-    threading.Thread(target=watchdog, daemon=True).start()
+    from harness import memwatch
+    memwatch.start_watchdog()
     prob = gen_anisotropic(N=N, P=P, lat=lat)
     x, c, s = prob["x"], prob["c"], prob["s"]
     M = s[0].size

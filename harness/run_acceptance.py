@@ -23,7 +23,6 @@ import pathlib
 import platform
 import subprocess
 import os
-import threading
 
 import numpy as np
 import mlx.core as mx
@@ -34,6 +33,7 @@ from harness.gen import (gen_anisotropic, gen_generic, direct_sum_mp,   # noqa
                          direct_sum, rel_l2)
 from mlx_nufft import Type3Plan, Type1Plan, Type2Plan           # noqa
 from mlx_nufft.sizing import finufft_width, set_nhg_type3   # noqa
+from harness import memwatch                                  # noqa
 
 RESDIR = pathlib.Path(__file__).resolve().parents[1] / "results"
 RESDIR.mkdir(exist_ok=True)
@@ -53,29 +53,8 @@ def machine():
     return f"{chip}, {mem} GB, {platform.platform()}"
 
 
-def watchdog(limit_gib=None):
-    if limit_gib is None:   # ~72% of machine RAM (11.5 GiB on a 16 GB mini)
-        import subprocess as _sp
-        ram = int(_sp.run(["sysctl", "-n", "hw.memsize"],
-                          capture_output=True, text=True).stdout) / 2**30
-        limit_gib = max(11.5, 0.72 * ram)
-    import subprocess as sp
-    pid = os.getpid()
-    while True:
-        rss = int(sp.run(["ps", "-o", "rss=", "-p", str(pid)],
-                         capture_output=True, text=True).stdout or 0)
-        gib = max(rss * 1024, mx.get_active_memory()) / 2**30
-        if gib > limit_gib:
-            print(f"WATCHDOG: {gib:.1f} GiB > {limit_gib} — abort",
-                  flush=True)
-            os._exit(3)
-        time.sleep(0.5)
-
-
 def machine_ram_gib():
-    import subprocess as _sp
-    return int(_sp.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
-                       text=True).stdout) / 2**30
+    return memwatch.ram_gib()
 
 
 def cpu_pred_gib(x, s, eps, sigma=1.25):
@@ -229,7 +208,7 @@ def adjoint_tests():
 
 if __name__ == "__main__":
     quick = "--quick" in sys.argv
-    threading.Thread(target=watchdog, daemon=True).start()
+    memwatch.start_watchdog()          # in-process: a forking poll slowed the CPU reference
     print(f"machine: {machine()}  eps={EPS_BY_GEOM} prec=crit64",
           flush=True)
 

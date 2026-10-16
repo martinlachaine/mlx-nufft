@@ -35,9 +35,11 @@ def arrays(p):
 
 
 def main():
-    cases = (("generic", gen_generic(N=768, P=2000, seed=4), 3e-5),
-             ("anisotropic", gen_anisotropic(N=768, P=2000, lat=1.5, seed=4), 1e-5))
-    chunk = g3._CHUNK
+    # small plans with a small chunk exercise the same thread-pool path that
+    # large plans take with the default chunk, within a CI runner's memory
+    cases = (("generic", gen_generic(N=256, P=2000, seed=4), 3e-5),
+             ("anisotropic", gen_anisotropic(N=256, P=2000, lat=1.5, seed=4), 1e-5))
+    default, chunk = g3._CHUNK, 1 << 13
     for name, g, eps in cases:
         M = g["s"][0].size
         for prec in ("crit64", "fp32", "phases64", "coords64"):
@@ -48,7 +50,7 @@ def main():
             same = all(u.dtype == v.dtype and np.array_equal(u.view(np.uint8), v.view(np.uint8))
                        for u, v in zip(a, b))
             check(f"{name} {prec} M={M} ({-(-M // chunk)} chunks): bit-identical", same)
-    g3._CHUNK = chunk
+    g3._CHUNK = default
     print(f"\n{'ALL PASS' if not FAILS else f'{len(FAILS)} FAILURES: {FAILS}'}")
     return 0 if not FAILS else 1
 
