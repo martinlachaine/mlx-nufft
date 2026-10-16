@@ -2,9 +2,9 @@
 
 ## v0.3.3 - 2026-10-16
 
-- Faster type-3 plan construction: the target-side setup runs on a thread pool, with bit-identical results. 4.19M targets on an M5 Max: 0.213 s to 0.068 s.
+- Faster type-3 plan construction: the target-side setup runs on a thread pool, with bit-identical results. 4.19M targets on an M5 Max: 210 ms to 68 ms.
 - `harness/run_acceptance.py` times FINUFFT through its plan interface and reports execute-to-execute (`speedup`) and plan-plus-execute (`speedup_total`) speedups. Peak memory is measured per configuration.
-- The memory watchdog in `harness/run_acceptance.py` and `harness/bench_gpu.py` no longer forks `ps`, which slowed the CPU reference by about 50 percent.
+- The memory watchdog in `harness/run_acceptance.py` and `harness/bench_gpu.py` no longer forks `ps`, which slowed the CPU reference by about 50%.
 
 ## v0.3.2 - 2026-09-26
 
