@@ -117,6 +117,19 @@ _SMALL_AXIS_DFT_LAST = (
 # transpose (two passes). False restores the v0.2.0 separate multiply.
 _FOUR_STEP_FUSED_TWIDDLE = (
     os.environ.get("MLX_NUFFT_FUSED_TWIDDLE", "1") == "1")
+# T3_CHAIN: the non-slab 3D type-3 FFT chain on the MLX backend.
+#   "prog"   (default) progressive pad: each axis is padded from nf to n_up
+#            and deconvolved just before its own FFT, and the pad of the two
+#            later axes is fused with the tiled transpose that brings the
+#            axis last (_padT_kernel), so the earlier FFTs run on smaller
+#            grids and no separate layout pass remains. The result stays in
+#            (z, y, x) order and the gather reads it there. Seven grid passes
+#            become six, on grids of 0.58, 0.76 and 1.0 of the full size.
+#   "legacy" the full pad+deconv pass, then fft_grid_stages (3 FFTs and 3
+#            tiled transposes under FFT_STRATEGY "transpose").
+# Grids with an axis of _SMALL_AXIS_DFT or less (the 1D and 2D embeddings)
+# and the VkFFT whole-grid path keep the legacy chain.
+T3_CHAIN = os.environ.get("MLX_NUFFT_T3_CHAIN", "prog")
 
 # mx.fast.metal_kernel buffers are indexed with int32: a kernel input/output
 # may hold at most 2**31-1 elements (probe-confirmed: 2147483647 OK,
@@ -320,6 +333,57 @@ def _tiled_permute(X, shape, in_strides, T=None, t_strides=None):
         grid=(-(-shp[a] // 32) * 32, -(-shp[-1] // 32) * 32, outer),
         threadgroup=(32, 32, 1))[0]
     return out.reshape(shape)
+
+
+# ---- fused pad + deconvolve + tiled transpose (progressive type-3 chain)
+_padT_kernels = {}
+
+
+def _padT_kernel(NA, NB, NC, SA, SC, nf, nu):
+    """out[(a*NB + b)*NC + c] = X[a*SA + b + m*SC] * dec[m] for the in-band
+    output index c of the padded axis (m its mode index, nf modes padded to
+    nu), else 0. Dim b has unit stride in X and lands in the middle of out,
+    so the kernel is a 32x32 threadgroup-tiled transpose of (b, c): loads
+    unit-stride along b, stores unit-stride along c. X complex64 read flat,
+    out complex64 of NA*NB*NC. grid=(ceil(NB/32)*32, ceil(NC/32)*32, NA),
+    threadgroup=(32, 32, 1). Cached by the compile-time constants."""
+    key = (NA, NB, NC, SA, SC, nf, nu)
+    k = _padT_kernels.get(key)
+    if k is not None:
+        return k
+    src = f"""
+    threadgroup float2 tile[32][33];
+    uint3 tg = threadgroup_position_in_grid;
+    uint3 tl = thread_position_in_threadgroup;
+    size_t a = tg.z;
+    int ib = (int)(tg.x * 32 + tl.x);
+    int ic = (int)(tg.y * 32 + tl.y);
+    if (ib < {NB} && ic < {NC}) {{
+        int q = ic;  q -= {nu} * (q >= {nu - nf // 2});
+        float2 v = float2(0.0f, 0.0f);
+        if (q >= {-(nf // 2)} && q < {nf // 2}) {{
+            int m = q + {nf // 2};
+            size_t ix = a * {SA} + (size_t)ib + (size_t)m * {SC};
+            float d = dec[m];
+            v = float2(X[ix].real * d, X[ix].imag * d);
+        }}
+        tile[tl.y][tl.x] = v;
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int ib2 = (int)(tg.x * 32 + tl.y);
+    int ic2 = (int)(tg.y * 32 + tl.x);
+    if (ib2 < {NB} && ic2 < {NC}) {{
+        float2 v = tile[tl.x][tl.y];
+        device float* Of = (device float*) out;
+        size_t io = (a * {NB} + (size_t)ib2) * {NC} + (size_t)ic2;
+        Of[2*io] = v.x; Of[2*io+1] = v.y;
+    }}
+"""
+    k = mx.fast.metal_kernel(
+        name=f"nufft_padT_{NA}x{NB}x{NC}_s{SA}x{SC}_nf{nf}",
+        input_names=["X", "dec"], output_names=["out"], source=src)
+    _padT_kernels[key] = k
+    return k
 
 
 # ---- dense DFT for short axes ------------------------------------------
@@ -924,6 +988,11 @@ class GpuT3Plan:
             low_mem = (2.0 * grid_bytes
                        > _LOW_MEM_FRAC * _total_ram_bytes())
         self.low_mem = bool(low_mem)
+        # progressive pad-and-transpose chain (T3_CHAIN): non-slab, MLX FFT,
+        # every upsampled axis longer than _SMALL_AXIS_DFT
+        self._prog = (T3_CHAIN == "prog" and not self.slab_mode
+                      and not self._vkfft_fft3
+                      and _strategy(self.n_up) == "transpose")
         self._kernels_P = None
         self._df64_setup = None
         self._ods = None            # source-side OD tables (set_sources)
@@ -972,16 +1041,24 @@ class GpuT3Plan:
             # GPU sort over the already-uploaded mirrors. The key order only
             # steers gather locality (results are written out[2*jp]), so the
             # unstable mx sort is as good as the host stable one.
-            key = ((self.mx_ti1[0] * nu2 + self.mx_ti1[1]) * nu3
-                   + self.mx_ti1[2])
+            if self._prog:    # the gather reads (z, y, x): sort for it
+                key = ((self.mx_ti1[2] * nu2 + self.mx_ti1[1]) * nu1
+                       + self.mx_ti1[0])
+            else:
+                key = ((self.mx_ti1[0] * nu2 + self.mx_ti1[1]) * nu3
+                       + self.mx_ti1[2])
             gperm = mx.argsort(key).astype(mx.uint32)
             self.mx_gperm = gperm
             self.mx_gi1 = [mx.take(v, gperm) for v in self.mx_ti1]
             self.mx_gfr = [mx.take(v, gperm) for v in self.mx_tfr]
         else:
             # int32 cell key would wrap: host int64 sort
-            key = ((self.t_i1[0].astype(np.int64) * nu2 + self.t_i1[1]) * nu3
-                   + self.t_i1[2])
+            if self._prog:
+                key = ((self.t_i1[2].astype(np.int64) * nu2 + self.t_i1[1]) * nu1
+                       + self.t_i1[0])
+            else:
+                key = ((self.t_i1[0].astype(np.int64) * nu2 + self.t_i1[1]) * nu3
+                       + self.t_i1[2])
             gperm = np.argsort(key, kind="stable")
             self.mx_gperm = mx.array(gperm.astype(np.uint32))
             self.mx_gi1 = [mx.array(v[gperm]) for v in self.t_i1]
@@ -1244,47 +1321,7 @@ class GpuT3Plan:
             name="t3pad", input_names=["bf", "dec1", "dec2", "dec3"],
             output_names=["H"], source=pad_src)
 
-        gather_src = f"""
-    uint kk = thread_position_in_grid.x;
-    if (kk >= {self.M}u) return;
-    float wx[{w2}], wy[{w2}], wz[{w2}];
-    int jx[{w2}], jy[{w2}], jz[{w2}];
-    float fx = tfrx[kk], fy = tfry[kk], fz = tfrz[kk];
-    int x0 = ti1x[kk], y0 = ti1y[kk], z0 = ti1z[kk];
-    for (int l = 0; l < {w2}; ++l) {{
-        wx[l] = k2_es((float)l - fx);
-        wy[l] = k2_es((float)l - fy);
-        wz[l] = k2_es((float)l - fz);
-        int a = x0 + l; a -= {nu1} * (a >= {nu1}); a += {nu1} * (a < 0); jx[l] = a;
-        int b = y0 + l; b -= {nu2} * (b >= {nu2}); b += {nu2} * (b < 0); jy[l] = b;
-        int c = z0 + l; c -= {nu3} * (c >= {nu3}); c += {nu3} * (c < 0); jz[l] = c;
-    }}
-    float accre = 0.0f, accim = 0.0f;
-    for (int lx = 0; lx < {w2}; ++lx) {{
-        for (int ly = 0; ly < {w2}; ++ly) {{
-            float wxy = wx[lx] * wy[ly];
-            size_t base = ((size_t)jx[lx] * {nu2} + (size_t)jy[ly]) * {nu3};
-            float sre = 0.0f, sim = 0.0f;
-            for (int lz = 0; lz < {w2}; ++lz) {{
-                float wv = wz[lz];
-                size_t idx = base + (size_t)jz[lz];
-                sre = metal::fma(v[2*idx], wv, sre);
-                sim = metal::fma(v[2*idx+1], wv, sim);
-            }}
-            accre = metal::fma(sre, wxy, accre);
-            accim = metal::fma(sim, wxy, accim);
-        }}
-    }}
-    float pre_ = post[2*kk], pim_ = post[2*kk+1];
-    out[2*kk]   = accre * pre_ - accim * pim_;
-    out[2*kk+1] = accre * pim_ + accim * pre_;
-"""
-        self._gather = mx.fast.metal_kernel(
-            name="t3gather",
-            input_names=["v", "ti1x", "ti1y", "ti1z",
-                         "tfrx", "tfry", "tfrz", "post"],
-            output_names=["out"], header="#include <metal_math>\n" + es2,
-            source=gather_src)
+        self._gather = self._build_gather(es2, sorted_=False, layout="xyz")
 
         # ---- OD spread + sorted gather (non-slab path) --------------------
         self._spread_od = None
@@ -1294,6 +1331,11 @@ class GpuT3Plan:
             self._spread_od = self._build_od_spread(es1, sdims)
         if self._tgt_sorted:
             self._gather_srt = self._build_sorted_gather(es2)
+        if self._prog:
+            self._gather_p = self._build_gather(es2, sorted_=False, layout="zyx")
+            self._gather_srt_p = (self._build_gather(es2, sorted_=True, layout="zyx")
+                                  if self._tgt_sorted else None)
+            self._pad1 = self._build_pad1()
 
         # ---- slab-mode kernels -------------------------------------------
         # pad + mode-deconvolve + brute z-DFT, writing z-major Z[l3, r1, r2]
@@ -1528,20 +1570,34 @@ class GpuT3Plan:
             source=src, atomic_outputs=True)
 
     def _build_sorted_gather(self, es):
-        """Cell-sorted gather: the naive per-target kernel run over the
-        cell-SORTED target arrays with the result written perm-indexed
-        (out[2*jp], caller order free) — neighbouring threads then interp
-        overlapping w2^3 neighbourhoods of the inner grid, so L1/L2 dedup
-        most of the scattered reads. Measured well ahead of a threadgroup-
-        tiled OD gather at type-3 target densities (~1 target per tile).
-        The final postphase multiply is folded in; post[] is indexed by the
-        ORIGINAL target index jp."""
+        return self._build_gather(es, sorted_=True, layout="xyz")
+
+    def _build_gather(self, es, sorted_, layout):
+        """Per-target interp of the transformed inner grid: one thread
+        gathers a whole point's w2^3 taps and folds the postphase in.
+
+        sorted_: the cell-sorted variant runs over the cell-SORTED target
+        arrays and writes out[2*jp] perm-indexed (caller order free), so
+        neighbouring threads interp overlapping neighbourhoods and L1/L2
+        dedup most of the scattered reads; measured well ahead of a
+        threadgroup-tiled OD gather at type-3 target densities (~1 target
+        per tile). post[] is indexed by the ORIGINAL target index.
+        layout: "xyz" reads the natural (nu1, nu2, nu3) grid, "zyx" the
+        (nu3, nu2, nu1) order the progressive chain leaves; the innermost
+        tap loop always runs along the unit-stride axis."""
         w2 = self.w2
         nu1, nu2, nu3 = self.n_up
+        if layout == "xyz":
+            S = dict(x=nu2 * nu3, y=nu3, z=1)
+            o, m, i = "x", "y", "z"
+        else:
+            S = dict(x=1, y=nu1, z=nu2 * nu1)
+            o, m, i = "z", "y", "x"
+        jp = "jp" if sorted_ else "kk"
         src = f"""
     uint kk = thread_position_in_grid.x;
     if (kk >= {self.M}u) return;
-    uint jp = gperm[kk];
+    {"uint jp = gperm[kk];" if sorted_ else ""}
     float wx[{w2}], wy[{w2}], wz[{w2}];
     int jx[{w2}], jy[{w2}], jz[{w2}];
     float fx = tfrx[kk], fy = tfry[kk], fz = tfrz[kk];
@@ -1555,31 +1611,96 @@ class GpuT3Plan:
         int c = z0 + l; c -= {nu3} * (c >= {nu3}); c += {nu3} * (c < 0); jz[l] = c;
     }}
     float accre = 0.0f, accim = 0.0f;
-    for (int lx = 0; lx < {w2}; ++lx) {{
-        for (int ly = 0; ly < {w2}; ++ly) {{
-            float wxy = wx[lx] * wy[ly];
-            size_t base = ((size_t)jx[lx] * {nu2} + (size_t)jy[ly]) * {nu3};
+    for (int lo = 0; lo < {w2}; ++lo) {{
+        for (int lm = 0; lm < {w2}; ++lm) {{
+            float wom = w{o}[lo] * w{m}[lm];
+            size_t base = (size_t)j{o}[lo] * {S[o]} + (size_t)j{m}[lm] * {S[m]};
             float sre = 0.0f, sim = 0.0f;
-            for (int lz = 0; lz < {w2}; ++lz) {{
-                float wv = wz[lz];
-                size_t idx = base + (size_t)jz[lz];
+            for (int li = 0; li < {w2}; ++li) {{
+                float wv = w{i}[li];
+                size_t idx = base + (size_t)j{i}[li];
                 sre = metal::fma(v[2*idx], wv, sre);
                 sim = metal::fma(v[2*idx+1], wv, sim);
             }}
-            accre = metal::fma(sre, wxy, accre);
-            accim = metal::fma(sim, wxy, accim);
+            accre = metal::fma(sre, wom, accre);
+            accim = metal::fma(sim, wom, accim);
         }}
     }}
-    float pre_ = post[2*jp], pim_ = post[2*jp+1];
-    out[2*jp]   = accre * pre_ - accim * pim_;
-    out[2*jp+1] = accre * pim_ + accim * pre_;
+    float pre_ = post[2*{jp}], pim_ = post[2*{jp}+1];
+    out[2*{jp}]   = accre * pre_ - accim * pim_;
+    out[2*{jp}+1] = accre * pim_ + accim * pre_;
 """
         return mx.fast.metal_kernel(
-            name="t3gather_srt",
-            input_names=["v", "gperm", "ti1x", "ti1y", "ti1z",
-                         "tfrx", "tfry", "tfrz", "post"],
+            name=f"t3gather{'_srt' if sorted_ else ''}_{layout}",
+            input_names=["v"] + (["gperm"] if sorted_ else [])
+                        + ["ti1x", "ti1y", "ti1z", "tfrx", "tfry", "tfrz", "post"],
             output_names=["out"], header="#include <metal_math>\n" + es,
             source=src)
+
+    def _build_pad1(self):
+        """First stage of the progressive chain: pad the z axis only (nf3 to
+        nu3) with its deconvolution factor, (nf1, nf2, nf3) -> (nf1, nf2,
+        nu3), float32 interleaved in and out, thread per output cell."""
+        nf1, nf2, nf3 = self.nf
+        nu3 = self.n_up[2]
+        src = f"""
+    uint r3 = thread_position_in_grid.x;
+    uint r2 = thread_position_in_grid.y;
+    uint r1 = thread_position_in_grid.z;
+    if (r3 >= {nu3}u || r2 >= {nf2}u || r1 >= {nf1}u) return;
+    size_t dst = ((size_t)r1 * {nf2} + r2) * {nu3} + r3;
+    int q3 = (int)r3;  q3 -= {nu3} * (q3 >= {nu3 - nf3 // 2});
+    if (!(q3 >= {-(nf3 // 2)} && q3 < {nf3 // 2})) {{
+        H[2*dst] = 0.0f; H[2*dst+1] = 0.0f; return;
+    }}
+    int m3 = q3 + {nf3 // 2};
+    size_t src = ((size_t)r1 * {nf2} + r2) * {nf3} + m3;
+    float d = dec3[m3];
+    H[2*dst]   = bf[2*src] * d;
+    H[2*dst+1] = bf[2*src+1] * d;
+"""
+        return mx.fast.metal_kernel(
+            name="t3pad_z", input_names=["bf", "dec3"], output_names=["H"],
+            source=src)
+
+    def _chain_prog(self, bf):
+        """The progressive chain (T3_CHAIN "prog") as a generator yielding
+        (label, array) per stage, lazily; the caller evaluates each. The
+        last array is the transformed grid in (nu3, nu2, nu1) order, (z, y,
+        x), consumed by the "zyx" gather. The z axis is padded in place
+        (pad_z) and transformed; the y and x pads are fused with the tiled
+        transpose that brings each axis last (padT_y, padT_x), so the
+        three FFTs run on 0.58, 0.76 and 1.0 of the full grid and there is
+        no layout pass of its own."""
+        nf1, nf2, nf3 = self.nf
+        nu1, nu2, nu3 = self.n_up
+        inv = self.isign > 0
+        H = self._pad1(
+            inputs=[bf, self.mx_dec[2]],
+            output_shapes=[(nf1 * nf2 * nu3 * 2,)], output_dtypes=[mx.float32],
+            grid=(nu3, nf2, nf1), threadgroup=(nu3 if nu3 <= 32 else 32,
+                                               1024 // min(nu3, 32), 1))[0]
+        yield "pad_z", H
+        bf = None
+        H = fft_axis(mx.view(H, dtype=mx.complex64).reshape(nf1, nf2, nu3),
+                     2, inv, self._twiddles)
+        yield "fft_z", H
+        H = _padT_kernel(nf1, nu3, nu2, nf2 * nu3, nu3, nf2, nu2)(
+            inputs=[H, self.mx_dec[1]],
+            output_shapes=[(nf1 * nu3 * nu2,)], output_dtypes=[mx.complex64],
+            grid=(-(-nu3 // 32) * 32, -(-nu2 // 32) * 32, nf1),
+            threadgroup=(32, 32, 1))[0]
+        yield "padT_y", H
+        H = fft_axis(H.reshape(nf1, nu3, nu2), 2, inv, self._twiddles)
+        yield "fft_y", H
+        H = _padT_kernel(nu3, nu2, nu1, nu2, nu3 * nu2, nf1, nu1)(
+            inputs=[H, self.mx_dec[0]],
+            output_shapes=[(nu3 * nu2 * nu1,)], output_dtypes=[mx.complex64],
+            grid=(-(-nu2 // 32) * 32, -(-nu1 // 32) * 32, nu3),
+            threadgroup=(32, 32, 1))[0]
+        yield "padT_x", H
+        H = fft_axis(H.reshape(nu3, nu2, nu1), 2, inv, self._twiddles)
+        yield "fft_x", H
 
     # ---- stage dispatch: OD spread / sorted gather when applicable ------
     def _spread_stage(self, cpf):
@@ -1606,15 +1727,16 @@ class GpuT3Plan:
             grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
             init_value=0)[0]
 
-    def _gather_stage(self, vf):
+    def _gather_stage(self, vf, prog=False):
+        """prog: vf holds the (z, y, x) grid of the progressive chain."""
         if self._tgt_sorted:
-            return self._gather_srt(
+            return (self._gather_srt_p if prog else self._gather_srt)(
                 inputs=[vf, self.mx_gperm] + self.mx_gi1 + self.mx_gfr
                        + [self.mx_post.reshape(-1)],
                 output_shapes=[(self.M * 2,)],
                 output_dtypes=[mx.float32],
                 grid=(self.M, 1, 1), threadgroup=(256, 1, 1))[0]
-        return self._gather(
+        return (self._gather_p if prog else self._gather)(
             inputs=[vf, self.mx_ti1[0], self.mx_ti1[1], self.mx_ti1[2],
                     self.mx_tfr[0], self.mx_tfr[1], self.mx_tfr[2],
                     self.mx_post.reshape(-1)],
@@ -1976,6 +2098,15 @@ class GpuT3Plan:
 
         bf = self._spread_stage(cpf)
         yield "spread", bf
+
+        if self._prog:
+            H = None
+            for label, H in self._chain_prog(bf):
+                yield label, H
+            vf = mx.view(H, dtype=mx.float32).reshape(-1)
+            out = self._gather_stage(vf, prog=True)
+            yield "gather", mx.view(out, dtype=mx.complex64)
+            return
 
         Hf = self._pad(
             inputs=[bf, self.mx_dec[0], self.mx_dec[1], self.mx_dec[2]],
@@ -2369,6 +2500,22 @@ class GpuT3Plan:
         del cpf
         mx.eval(bf)
         _trim()
+
+        if self._prog:
+            H = None
+            for _label, Hn in self._chain_prog(bf):
+                del H
+                H = Hn
+                del Hn
+                mx.eval(H)
+                bf = None       # the generator drops its own reference
+                _trim()
+            vf = mx.view(H, dtype=mx.float32).reshape(-1)
+            out = self._gather_stage(vf, prog=True)
+            del H, vf
+            res = mx.view(out, dtype=mx.complex64)
+            mx.eval(res)
+            return _host(res) if return_np else res
 
         H = self._pad(
             inputs=[bf, self.mx_dec[0], self.mx_dec[1], self.mx_dec[2]],

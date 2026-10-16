@@ -161,7 +161,7 @@ def t1_stages(plan, c):
         grid=g, threadgroup=tg)[0]
     res = mx.view(fk, dtype=mx.complex64).reshape(*plan.N)
     yield "crop_x+deconv", res
-    yield "d2h", np.array(res)
+    yield "d2h", np.asarray(res)
 
 
 def t2_stages(plan, fk):
@@ -209,7 +209,7 @@ def t2_stages(plan, fk):
             plan._mx_inv = mx.array(inv_perm.astype(np.uint32))
         res = mx.take(res, plan._mx_inv)
         yield "unsort", res
-    yield "d2h", np.array(res)
+    yield "d2h", np.asarray(res)
 
 
 def t3_stages(plan, c):
@@ -228,6 +228,24 @@ def t3_stages(plan, c):
     del cpf
     yield "spread", bf
     _trim()
+    if getattr(plan, "_prog", False):
+        # progressive chain (gpu_t3.T3_CHAIN): each stage is one kernel or
+        # one last-axis FFT, evaluated here as in execute()
+        H = None
+        for label, Hn in plan._chain_prog(bf):
+            del H
+            H = Hn
+            del Hn
+            yield label, H
+            bf = None
+            _trim()
+        vf = mx.view(H, dtype=mx.float32).reshape(-1)
+        out = plan._gather_stage(vf, prog=True)
+        del H, vf
+        res = mx.view(out, dtype=mx.complex64)
+        yield "gather", res
+        yield "d2h", np.asarray(res)
+        return
     H = plan._pad(
         inputs=[bf, plan.mx_dec[0], plan.mx_dec[1], plan.mx_dec[2]],
         output_shapes=[(nu1 * nu2 * nu3 * 2,)],
@@ -257,7 +275,7 @@ def t3_stages(plan, c):
     del H, vf
     res = mx.view(out, dtype=mx.complex64)
     yield "gather", res
-    yield "d2h", np.array(res)
+    yield "d2h", np.asarray(res)
 
 
 STAGE_FNS = {1: t1_stages, 2: t2_stages, 3: t3_stages}
