@@ -647,6 +647,47 @@ def _four_step(H, axis, inverse, twiddle_cache, scrambled):
     return X.reshape(*lead, n, *rest)
 
 
+def _four_step_dft_steps(H, axis, inverse, twiddle_cache, scrambled):
+    """The dense-DFT four-step of _four_step as a generator of its four (or
+    three) arrays, each built lazily from the previous one. The generator
+    drops its own reference to each input once the next step's graph holds
+    it, so a caller that evaluates every yield and rebinds its variable keeps
+    at most the input, the current and the next array alive (the lazy
+    _four_step holds every intermediate of one eval). axis must admit
+    _split_dft; the last yield is the transform (scrambled when asked)."""
+    n = H.shape[axis]
+    fft1 = mx.fft.ifft if inverse else mx.fft.fft
+    shp = list(H.shape)
+    lead, rest = shp[:axis], shp[axis + 1:]
+    L, R = int(np.prod(lead)), int(np.prod(rest))
+    n1, n2 = _split_dft(n)
+    nt = L * n2 * R
+    A = _dft_tw_kernel(n1, n2 * R, nt, R, n2)(
+        inputs=[H, _dft_table(n1, inverse, twiddle_cache),
+                _twiddle_table_dft(n, n1, n2, inverse, twiddle_cache)],
+        output_shapes=[(L * n1 * n2 * R,)], output_dtypes=[mx.complex64],
+        grid=(-(-nt // _DFT_TG) * _DFT_TG, 1, 1),
+        threadgroup=(_DFT_TG, 1, 1))[0]
+    H = None
+    yield A
+    if R == 1:
+        B = A.reshape(L * n1, n2)
+    else:
+        B = _tiled_permute(A, (L, n1, R, n2), (n1 * n2 * R, n2 * R, 1, R))
+        A = None
+        yield B
+    C = fft1(B.reshape(-1, n2), axis=-1)
+    A = B = None
+    if scrambled:
+        yield C.reshape(*lead, n, *rest)
+        return
+    yield C
+    X = _tiled_permute(C.reshape(L, n1, R, n2), (L, n2, n1, R),
+                       (n1 * R * n2, 1, R * n2, n2))
+    C = None
+    yield X.reshape(*lead, n, *rest)
+
+
 def fft_axis(H, axis, inverse, twiddle_cache=None):
     """(i)FFT along one axis; four-step Cooley-Tukey for long non-pow2 axes.
 
@@ -2385,11 +2426,19 @@ class GpuT3Plan:
             # dense-DFT four-steps (see _four_step): axis 2 scrambled in 2
             # passes, axis 1 natural in 4, with nu2 kept as the trailing
             # dim; 6 passes against the balanced split's 9
+            # one eval per step, rebinding X each time, keeps the peak at
+            # three lateral blocks (the input, the current and the next),
+            # as the balanced-split block below does
             X = Z.reshape(nl, nu1, nu2)
-            X, _ = fft_axis_scrambled(X, 2, inv, self._twiddles)
-            mx.eval(X)
-            X = fft_axis(X, 1, inv, self._twiddles)
-            mx.eval(X)
+            for ax, scr in ((2, True), (1, False)):
+                if _is_native(X.shape[ax]):
+                    X = fft1(X, axis=ax)
+                    mx.eval(X)
+                    continue
+                for Xn in _four_step_dft_steps(X, ax, inv, self._twiddles, scr):
+                    X = Xn
+                    del Xn
+                    mx.eval(X)
             return X.reshape(nl, nu1, nu2)
 
         def _twt(X, L, n1, n2, R, n):
