@@ -16,7 +16,7 @@ import numpy as np
 import mlx.core as mx
 
 from .sizing import kernel_params, kernel_ft, next235even
-from .gpu_t3 import _es_msl, fft_axis
+from .gpu_t3 import _es_msl, fft_axis, _host
 
 PI = np.pi
 
@@ -176,7 +176,7 @@ class Type1Plan(_Points12):
         del H, vf
         res = mx.view(fk, dtype=mx.complex64).reshape(N1, N2, N3)
         mx.eval(res)
-        return np.array(res) if return_np else res
+        return _host(res) if return_np else res
 
 
 class Type2Plan(_Points12):
@@ -282,7 +282,7 @@ class Type2Plan(_Points12):
         mx.eval(res)
         if not return_np:
             return res
-        res = np.array(res)
+        res = _host(res)
         if self.sorted:
             inv = np.empty_like(self.perm)
             inv[self.perm] = np.arange(self.P)

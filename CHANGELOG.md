@@ -2,6 +2,8 @@
 
 ## v0.3.3 - 2026-10-16
 
+- Type-1 tile spread in 2D and 3D accumulates in int32 fixed point with native integer atomics instead of a float CAS loop (`MLX_NUFFT_OD_ACC=cas` restores it). M5 Max, density 1, eps 1e-5: 3D 96^3 with 7.1M points 17.6 ms to 8.4 ms, 2D 1024^2 with 4.2M points 2.8 ms to 2.4 ms. Error against fp64 FINUFFT unchanged at eps 1e-5 and 7 to 20% higher at eps 1e-6 (`harness/test_od_acc.py`).
+- Results return as zero-copy views of the device buffer (`np.asarray`) instead of copies: a 128 MiB result in 0.02 ms instead of 2 ms.
 - Faster type-3 plan construction: the target-side setup runs on a thread pool, with bit-identical results. 4.19M targets on an M5 Max: 210 ms to 68 ms.
 - `harness/run_acceptance.py` times FINUFFT through its plan interface and reports execute-to-execute (`speedup`) and plan-plus-execute (`speedup_total`) speedups. Peak memory is measured per configuration.
 - The memory watchdog in `harness/run_acceptance.py` and `harness/bench_gpu.py` no longer forks `ps`, which slowed the CPU reference by about 50%.

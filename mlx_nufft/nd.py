@@ -36,12 +36,44 @@ import numpy as np
 import mlx.core as mx
 
 from .sizing import kernel_params, kernel_ft_fast, next235even
-from .gpu_t3 import _es_msl, fft_axis, _DF64_HDR, _MK_MAX_ELEMS
+from .gpu_t3 import _es_msl, fft_axis, _DF64_HDR, _MK_MAX_ELEMS, _host
 
 PI = np.pi
 _log = logging.getLogger(__name__)
 
 _AX = ("x", "y", "z")
+
+# ---- OD spread accumulation switch (perf A/B; correctness in
+# harness/test_od_acc.py). Read when a plan builds its spread kernel; the
+# environment variable sets the process-wide default.
+#   "cas"  lanes parallelize over (point, tap) tasks and add into the
+#          threadgroup tile with bit-cast CAS loops (tg_fadd): every lane
+#          busy, but Metal has no threadgroup float atomic and the CAS
+#          loop serializes (246 G adds/s scattered, M5 Max probe).
+#   "own"  each lane owns a contiguous run of tile cells and walks the
+#          batch's points, adding the taps that land on its cells with
+#          plain threadgroup loads and stores: no atomics (717 G adds/s in
+#          the same probe), at the price of a per-point range test per
+#          lane. Measured 2x to 4x slower than "cas" at density 1 (M5 Max):
+#          nearly half of a batch's points hit every interior row, so the
+#          tests dominate. Kept for reference.
+#   "fix"  the tile accumulates int32 fixed-point values with native
+#          integer atomics (470 G adds/s in the probe). The subproblem's
+#          scale is (2^31 - 600) / sum_j |c_j| over its points, so no cell
+#          can overflow (every kernel weight is at most 1, at most 1024
+#          rounded adds land on a cell), and the flush converts back. Each
+#          add rounds to the nearest 1/scale.
+#          Dims 2 and 3 only; dim 1 keeps "cas".
+#          Measured on an M5 Max at density 1: 3D type 1 at eps 1e-5 runs
+#          2.1x faster than "cas" (17.6 to 8.4 ms for 7.1M points on
+#          96^3 modes), 2D 1.17x; the error against an fp64 reference is
+#          unchanged at eps 1e-5 (1.22e-5 vs 1.21e-5) and 7 to 20 percent
+#          higher at eps 1e-6 (1.8e-6 vs 1.7e-6 random, 2.1e-6 vs 1.7e-6
+#          clustered), the quantization noise. Default.
+OD_ACC = os.environ.get("MLX_NUFFT_OD_ACC", "fix")
+# points per batch of the OD spread inner loop (None: the per-dim default
+# _OD_SPREAD_B); threadgroup memory bounds it (tile + B*(dim*w+dim+2) words)
+OD_B = os.environ.get("MLX_NUFFT_OD_B")
 
 # ---- type-2 pad path switch (perf A/B; correctness in
 # harness/test_pad_crop_paths.py). Read at call time, so it can be flipped
@@ -758,7 +790,7 @@ class Type1PlanND(_PointsND):
 
     # points per batch in the OD spread inner loop; staging costs
     # B*(dim*w + dim + 2) threadgroup words on top of the 2*ptot-word tile
-    _OD_SPREAD_B = {1: 32, 2: 32, 3: 16}
+    _OD_SPREAD_B = {1: 32, 2: 32, 3: 32}   # 3D: 32 is 15% faster at w=4 (fix)
 
     # threadgroup float add: bit-cast CAS on atomic_uint (Metal has no
     # threadgroup-scope atomic_float); contention is low — concurrent
@@ -772,47 +804,84 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
 }
 """
 
-    def _build_od_spread(self, es):
+    def _build_od_spread(self, es, acc=None):
         """Output-driven spread: one threadgroup per subproblem, padded tile
         in threadgroup memory. Points are processed in batches of B: lanes
         0..bn stage their point's strength (perm-gather) + tile cell offsets,
         all lanes cooperatively stage the per-dim 1D ES weights (layout
-        wts[b][d][l]); after one barrier a flat loop over the batch's tap
-        tasks accumulates into the tile with bit-cast CAS float adds
-        (tg_fadd) — two barriers per batch instead of one per point, and all
-        lanes stay busy. In dims 1-2 a task is one (point, tap); in 3D a
-        task is (point, ax, ay) and the z taps ride a register loop over
-        contiguous tile cells (one decode + xy-weight load per w adds).
-        Flush: one global atomic add per tile cell, periodic wrap."""
+        wts[b][d][l]); after one barrier the batch's taps are accumulated
+        into the tile, two barriers per batch instead of one per point.
+        acc "cas": a flat loop over the batch's tap tasks with bit-cast CAS
+        float adds (tg_fadd); in dims 1-2 a task is one (point, tap), in 3D
+        (point, ax, ay) with the z taps on a register loop. acc "own": each
+        lane owns a run of OD_ACC cells (at most two tile rows) and, per
+        point, adds the taps that fall on them with plain stores.
+        Flush: one global atomic add per nonzero tile cell, periodic wrap."""
         dim, w = self.dim, self.w
         nu = self.n_up
         m, p, ptot = self._od_m, self._od_p, self._od_ptot
         TG = self._OD_TG
         taps = w ** dim
-        B = self._OD_SPREAD_B[dim]
+        B = int(OD_B) if OD_B else self._OD_SPREAD_B[dim]
+        if acc is None:
+            acc = OD_ACC if dim > 1 else "cas"
+        assert acc in ("cas", "own", "fix")
         dw = dim * w
+        tile_decl = {"cas": "threadgroup atomic_uint", "own": "threadgroup float",
+                     "fix": "threadgroup atomic_int"}[acc]
+        tile_zero = {"cas": "atomic_store_explicit(&tile[q], 0u, memory_order_relaxed);",
+                     "own": "tile[q] = 0.0f;",
+                     "fix": "atomic_store_explicit(&tile[q], 0, memory_order_relaxed);"}[acc]
         src = f"""
     uint tid = thread_position_in_threadgroup.x;
     uint sub = threadgroup_position_in_grid.y;
-    threadgroup atomic_uint tile[{2 * ptot}];
+    {tile_decl} tile[{2 * ptot}];
     threadgroup float wts[{B * dw}];
     threadgroup float str[{2 * B}];
     threadgroup int loff[{B * dim}];
     for (uint q = tid; q < {2 * ptot}u; q += {TG}u)
-        atomic_store_explicit(&tile[q], 0u, memory_order_relaxed);
+        {tile_zero}
     uint s0 = (uint)sub_start[sub];
     uint cnt = (uint)sub_count[sub];
 """
         for d in range(dim):
             src += f"    int o{_AX[d]} = sub_o{_AX[d]}[sub];\n"
+        if acc == "fix":
+            src += f"""    threadgroup atomic_uint csum;
+    if (tid == 0) atomic_store_explicit(&csum, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {{
+        float part = 0.0f;
+        for (uint q = tid; q < cnt; q += {TG}u) {{
+            uint jp = perm[s0 + q];
+            part += metal::fabs(cj[2*jp]) + metal::fabs(cj[2*jp+1]);
+        }}
+        part = metal::simd_sum(part);
+        if (thread_index_in_simdgroup == 0 && part > 0.0f) tg_fadd(&csum, part);
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float csum_f = as_type<float>(atomic_load_explicit(&csum, memory_order_relaxed));
+    if (csum_f == 0.0f) return;
+    float scl = 2147483000.0f / csum_f;
+    float inv_scl = csum_f * 4.656613e-10f;
+"""
+        if acc == "own":
+            # owned flat cells [c0, c1), rows of plast cells along the last dim
+            cpt = -(-ptot // TG)
+            plast = p[dim - 1]
+            src += f"""    uint c0 = metal::min({cpt}u * tid, {ptot}u);
+    uint c1 = metal::min(c0 + {cpt}u, {ptot}u);
+    uint r0 = c0 / {plast}u;
+    uint r1 = (c1 > c0) ? (c1 - 1u) / {plast}u : r0;
+"""
         src += f"""    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint t0 = 0; t0 < cnt; t0 += {B}u) {{
         uint bn = metal::min({B}u, cnt - t0);
         uint base = s0 + t0;
         if (tid < bn) {{
             uint jp = perm[base + tid];
-            str[2*tid]   = cj[2*jp];
-            str[2*tid+1] = cj[2*jp+1];
+            str[2*tid]   = cj[2*jp]{" * scl" if acc == "fix" else ""};
+            str[2*tid+1] = cj[2*jp+1]{" * scl" if acc == "fix" else ""};
 """
         for d in range(dim):
             src += (f"            loff[{dim}u*tid + {d}u] = "
@@ -826,7 +895,74 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
         }}
 """
         src += "        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
-        if dim == 1:
+        if acc == "own":
+            plast = p[dim - 1]
+            if dim == 3:
+                row_dec = f"uint rx = r / {p[1]}u, ry = r % {p[1]}u;"
+                row_test = (f"int ax = (int)rx - lx, ay = (int)ry - ly;\n"
+                            f"                if ((uint)ax >= {w}u || (uint)ay >= {w}u) continue;\n"
+                            f"                float wr = wts[b * {dw}u + ax] * wts[b * {dw}u + {w}u + ay];")
+                lo_dec = "int lx = loff[3u*b], ly = loff[3u*b+1u], ll = loff[3u*b+2u];"
+            else:
+                row_dec = "uint rx = r;"
+                row_test = (f"int ax = (int)rx - lx;\n"
+                            f"                if ((uint)ax >= {w}u) continue;\n"
+                            f"                float wr = wts[b * {dw}u + ax];")
+                lo_dec = "int lx = loff[2u*b], ll = loff[2u*b+1u];"
+            src += f"""        if (c1 > c0) {{
+            for (uint b = 0; b < bn; ++b) {{
+                {lo_dec}
+                float sre = str[2*b], sim = str[2*b+1];
+                for (uint r = r0; r <= r1; ++r) {{
+                    {row_dec}
+                    {row_test}
+                    float cre = sre * wr, cim = sim * wr;
+                    uint rb = r * {plast}u;
+                    int za = (int)(metal::max(rb, c0) - rb);
+                    int zb = (int)(metal::min(rb + {plast}u, c1) - rb);
+                    int zlo = metal::max(za, ll), zhi = metal::min(zb, ll + {w});
+                    for (int z = zlo; z < zhi; ++z) {{
+                        float wz = wts[b * {dw}u + {(dim - 1) * w}u + (uint)(z - ll)];
+                        uint cell = rb + (uint)z;
+                        tile[2*cell]   += cre * wz;
+                        tile[2*cell+1] += cim * wz;
+                    }}
+                }}
+            }}
+        }}
+"""
+        elif acc == "fix":
+            # strengths are pre-scaled at staging (str holds c * scl)
+            if dim == 2:
+                src += f"""        for (uint q = tid; q < bn * {taps}u; q += {TG}u) {{
+            uint b = q / {taps}u;
+            uint tap = q % {taps}u;
+            uint ax = tap / {w}u, ay = tap % {w}u;
+            float wgt = wts[b * {dw}u + ax] * wts[b * {dw}u + {w}u + ay];
+            uint cell = (uint)(loff[2u*b] + (int)ax) * {p[1]}u
+                      + (uint)(loff[2u*b+1u] + (int)ay);
+            atomic_fetch_add_explicit(&tile[2*cell],   (int)metal::rint(str[2*b]   * wgt), memory_order_relaxed);
+            atomic_fetch_add_explicit(&tile[2*cell+1], (int)metal::rint(str[2*b+1] * wgt), memory_order_relaxed);
+        }}
+"""
+            else:
+                src += f"""        for (uint q = tid; q < bn * {w * w}u; q += {TG}u) {{
+            uint b = q / {w * w}u;
+            uint rem = q % {w * w}u;
+            uint ax = rem / {w}u, ay = rem % {w}u;
+            float wxy = wts[b * {dw}u + ax] * wts[b * {dw}u + {w}u + ay];
+            float cre = str[2*b] * wxy, cim = str[2*b+1] * wxy;
+            uint cell0 = ((uint)(loff[3u*b] + (int)ax) * {p[1]}u
+                        + (uint)(loff[3u*b+1u] + (int)ay)) * {p[2]}u
+                       + (uint)loff[3u*b+2u];
+            for (uint az = 0; az < {w}u; ++az) {{
+                float wz = wts[b * {dw}u + {2 * w}u + az];
+                atomic_fetch_add_explicit(&tile[2*(cell0 + az)],   (int)metal::rint(cre * wz), memory_order_relaxed);
+                atomic_fetch_add_explicit(&tile[2*(cell0 + az)+1], (int)metal::rint(cim * wz), memory_order_relaxed);
+            }}
+        }}
+"""
+        elif dim == 1:
             src += f"""        for (uint q = tid; q < bn * {taps}u; q += {TG}u) {{
             uint b = q / {taps}u;
             uint ax = q % {taps}u;
@@ -868,8 +1004,21 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
         src += """        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 """
-        # flush padded tile to the global fine grid with periodic wrap
-        src += f"    for (uint q = tid; q < {ptot}u; q += {TG}u) {{\n"
+        # flush the nonzero padded-tile cells to the global fine grid with
+        # periodic wrap (a sparse tile is mostly zeros: skipping them costs
+        # one compare and saves the global atomic)
+        if acc == "cas":
+            rd = ("float vr = as_type<float>(atomic_load_explicit(&tile[2*q], memory_order_relaxed));\n"
+                  "        float vi = as_type<float>(atomic_load_explicit(&tile[2*q+1], memory_order_relaxed));")
+        elif acc == "fix":
+            rd = ("float vr = (float)atomic_load_explicit(&tile[2*q], memory_order_relaxed) * inv_scl;\n"
+                  "        float vi = (float)atomic_load_explicit(&tile[2*q+1], memory_order_relaxed) * inv_scl;")
+        else:
+            rd = "float vr = tile[2*q], vi = tile[2*q+1];"
+        src += f"""    for (uint q = tid; q < {ptot}u; q += {TG}u) {{
+        {rd}
+        if (vr == 0.0f && vi == 0.0f) continue;
+"""
         if dim == 1:
             src += "        int px = (int)q;\n"
         elif dim == 2:
@@ -887,22 +1036,17 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
                     f"g{a} += {nu[d]} * (g{a} < 0);\n")
         gexpr = _linearize([f"g{_AX[d]}" for d in range(dim)], nu)
         src += f"""        size_t cell = {gexpr};
-        atomic_fetch_add_explicit(&grid[2*cell],
-            as_type<float>(atomic_load_explicit(&tile[2*q],
-                                                memory_order_relaxed)),
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(&grid[2*cell+1],
-            as_type<float>(atomic_load_explicit(&tile[2*q+1],
-                                                memory_order_relaxed)),
-            memory_order_relaxed);
+        atomic_fetch_add_explicit(&grid[2*cell],   vr, memory_order_relaxed);
+        atomic_fetch_add_explicit(&grid[2*cell+1], vi, memory_order_relaxed);
     }}
 """
         innames = (["cj", "perm"] + [f"i1{_AX[d]}" for d in range(dim)]
                    + [f"fr{_AX[d]}" for d in range(dim)]
                    + ["sub_start", "sub_count"]
                    + [f"sub_o{_AX[d]}" for d in range(dim)])
+        self._od_acc = acc
         return mx.fast.metal_kernel(
-            name=f"t1spread{dim}d_od", input_names=innames,
+            name=f"t1spread{dim}d_od_{acc}_b{B}", input_names=innames,
             output_names=["grid"], header=self._TG_FADD + es,
             source=src, atomic_outputs=True)
 
@@ -1337,7 +1481,7 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
             mx.view(bf, dtype=mx.complex64).reshape(*self.n_up))
         del bf
         mx.eval(res)
-        return np.array(res) if return_np else res
+        return _host(res) if return_np else res
 
     def set_sources(self, x, backend="host"):
         """Cheaply re-point the plan to new nonuniform coordinates, reusing the
@@ -1505,7 +1649,7 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
             outs.append(ob)
         res = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=0)
         mx.eval(res)
-        return np.array(res) if return_np else res
+        return _host(res) if return_np else res
 
     def execute_disjoint(self, c, groups, return_np=True):
         """Disjoint-support batch: G subsets of the SAME point set, each
@@ -1561,7 +1705,7 @@ inline void tg_fadd(threadgroup metal::atomic_uint *a, float v) {
             outs.append(fk)
         res = mx.stack(outs)
         mx.eval(res)
-        return np.array(res) if return_np else res
+        return _host(res) if return_np else res
 
 
 class Type2PlanND(_PointsND):
@@ -1973,4 +2117,4 @@ class Type2PlanND(_PointsND):
                 self._mx_inv = mx.array(inv.astype(np.uint32))
             res = mx.take(res, self._mx_inv)
         mx.eval(res)
-        return np.array(res) if return_np else res
+        return _host(res) if return_np else res
