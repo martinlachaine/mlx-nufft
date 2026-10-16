@@ -1188,9 +1188,11 @@ class GpuT3Plan:
     def _od_source_dims(self):
         """Tile dims for the source-side OD spread, or None when the naive
         kernel should be used (small P, unsorted plans, w < 5 where the
-        direct atomic spread is equally fast, slab path, tile misfit)."""
-        if self.slab_mode or not self._sort_points \
-                or self.P < _OD_MIN_PTS or self.w < 5:
+        direct atomic spread is equally fast, tile misfit, or an nf grid
+        whose float-interleaved form exceeds the metal_kernel element cap:
+        the slab path then keeps its complex64-typed direct spread)."""
+        if not self._sort_points or self.P < _OD_MIN_PTS or self.w < 5 \
+                or 2 * int(np.prod(self.nf)) > _MK_MAX_ELEMS:
             return None
         return _od_tile_dims_t3(self.w, self.nf)
 
@@ -1445,8 +1447,8 @@ class GpuT3Plan:
         # ---- OD spread + sorted gather (non-slab path) --------------------
         self._spread_od = None
         self._gather_srt = None
-        sdims = _od_tile_dims_t3(w, self.nf)
-        if not self.slab_mode and sdims is not None:
+        sdims = self._od_source_dims()
+        if sdims is not None:
             self._spread_od = self._build_od_spread(es1, sdims)
         if self._tgt_sorted:
             self._gather_srt = self._build_sorted_gather(es2)
@@ -2452,16 +2454,22 @@ class GpuT3Plan:
         # sort + prephase are fused into the spread kernel (perm/pre inputs)
         cpf = mx.view(cmx, dtype=mx.float32)
 
-        # complex64-typed spread grid: nf1*nf2*nf3 elements (not 2x), so the
-        # nf grid stays under the metal_kernel int32 cap to ~n_up 13.6k/axis.
-        bf = self._spread_c(
-            inputs=[cpf, self.mx_perm, mx.view(self.mx_pre, dtype=mx.float32),
-                    self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
-                    self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
-            output_shapes=[(nf1 * nf2 * nf3,)],
-            output_dtypes=[mx.complex64],
-            grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
-            init_value=0)[0]
+        if self._ods is not None:
+            # tile spread (same kernel as the non-slab path; 1e6 sources on
+            # the 5400^2 x 24 case: 44 ms of direct atomics to 10 ms)
+            bf = mx.view(self._spread_stage(cpf), dtype=mx.complex64)
+        else:
+            # complex64-typed spread grid: nf1*nf2*nf3 elements (not 2x), so
+            # the nf grid stays under the metal_kernel int32 cap to ~n_up
+            # 13.6k/axis
+            bf = self._spread_c(
+                inputs=[cpf, self.mx_perm, mx.view(self.mx_pre, dtype=mx.float32),
+                        self.mx_i1[0], self.mx_i1[1], self.mx_i1[2],
+                        self.mx_fr[0], self.mx_fr[1], self.mx_fr[2]],
+                output_shapes=[(nf1 * nf2 * nf3,)],
+                output_dtypes=[mx.complex64],
+                grid=(w * w, self.P, 1), threadgroup=(w * w, 1024 // (w * w), 1),
+                init_value=0)[0]
         del cpf
         mx.eval(bf)
         if self.low_mem:

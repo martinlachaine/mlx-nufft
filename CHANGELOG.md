@@ -6,6 +6,7 @@
 - Results return as zero-copy views of the device buffer (`np.asarray`) instead of copies: a 128 MiB result in 0.02 ms instead of 2 ms.
 - Type 3 on full 3D grids pads and deconvolves each axis just before its own FFT, with the pad of the later axes fused into the tiled transpose that brings the axis last, and the gather reads the transposed result (`MLX_NUFFT_T3_CHAIN=legacy` restores the full pad and separate transposes). M5 Max, 640^3 grid, 1e6 sources: 69 ms to 50 ms at 262k targets, 77 ms to 58 ms at 4.19M; peak memory 5.9 GiB to 5.0 GiB.
 - Four-step FFTs of non-native lengths start with a dense DFT of the smallest factor (at most 32) in place over the strided axis, twiddle included, followed by one native FFT: 2 passes instead of 4 on a scrambled last axis, 4 instead of 5 on a middle axis. M5 Max, anisotropic type 3 (5400^2 x 24 grid), 1e6 sources: 281 ms to 198 ms; the per-slab path 653 ms to 524 ms.
+- The slab type-3 path uses the tile spread (it kept the direct atomic spread). Same case, 1e6 sources: 198 ms to 170 ms.
 - Faster type-3 plan construction: the target-side setup runs on a thread pool, with bit-identical results. 4.19M targets on an M5 Max: 210 ms to 68 ms.
 - `harness/run_acceptance.py` times FINUFFT through its plan interface and reports execute-to-execute (`speedup`) and plan-plus-execute (`speedup_total`) speedups. Peak memory is measured per configuration.
 - The memory watchdog in `harness/run_acceptance.py` and `harness/bench_gpu.py` no longer forks `ps`, which slowed the CPU reference by about 50%.
