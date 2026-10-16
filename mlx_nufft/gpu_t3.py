@@ -192,6 +192,32 @@ def _is_native(n):
     return n <= _FFT_NATIVE_MAX or ((n & (n - 1)) == 0 and n <= _FFT_POW2_MAX)
 
 
+def _smooth(n):
+    for q in (2, 3, 5, 7, 11, 13):
+        while n % q == 0:
+            n //= q
+    return n == 1
+
+
+def _split_dft(n):
+    """Four-step split n = n1*n2 with the SMALLEST n1 <= _SMALL_AXIS_DFT
+    whose cofactor n2 is a native Stockham length (<= _FFT_NATIVE_MAX,
+    radix 2,3,5,7,11,13): the first stage is then the dense n1-point DFT in
+    place over the strided axis with the twiddle folded in (_dft_tw), and
+    the second a native last-axis FFT. None when no such n1 exists."""
+    for n1 in range(2, _SMALL_AXIS_DFT + 1):
+        if n % n1 == 0 and n // n1 <= _FFT_NATIVE_MAX and _smooth(n // n1):
+            return (n1, n // n1)
+    return None
+
+
+def _split_axis(n):
+    """The split _four_step takes for a non-native length n: the dense-DFT
+    split when one exists, else the balanced one. Every consumer of a
+    scrambled axis (the slab gathers) derives its index map from this."""
+    return _split_dft(n) or _split_n(n)
+
+
 def _split_native(n):
     """Four-step split for the slab fast path; (n, 1) for native lengths.
 
@@ -200,7 +226,7 @@ def _split_native(n):
     """
     if _is_native(n):
         return (n, 1)
-    return _split_n(n)
+    return _split_axis(n)
 
 
 def _strategy(shape):
@@ -457,6 +483,69 @@ def _dft_kernel(n, R, nt):
     return k
 
 
+def _dft_tw_kernel(n, R, nt, Rt, n2):
+    """_dft_kernel with the four-step twiddle folded into the output: column
+    (l, r) of the (L, n, R) array is the k1 run of four-step index k = k1*n2
+    + k2 with k2 = r / Rt (Rt trailing elements per k2), and output f1 is
+    multiplied by T[f1*n2 + k2] = exp(sgn 2 pi i f1 k2 / (n*n2))."""
+    key = (n, R, nt, Rt, n2)
+    k = _dft_tw_kernels.get(key)
+    if k is not None:
+        return k
+    src = f"""
+    uint t = thread_position_in_grid.x;
+    threadgroup float2 Wt[{n * n}];
+    for (uint q = thread_position_in_threadgroup.x; q < {n * n}u; q += {_DFT_TG}u)
+        Wt[q] = float2(W[q].real, W[q].imag);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (t >= {nt}u) return;
+    uint r = t % {R}u;
+    size_t base = (size_t)(t / {R}u) * {n * R} + (size_t)r;
+    uint k2 = r / {Rt}u;
+    float xr[{n}], xi[{n}];
+    for (int k = 0; k < {n}; ++k) {{
+        xr[k] = X[base + (size_t)k * {R}].real;
+        xi[k] = X[base + (size_t)k * {R}].imag;
+    }}
+    device float* Yf = (device float*) Y;
+    for (int f = 0; f < {n}; ++f) {{
+        float ar = 0.0f, ai = 0.0f;
+        for (int k = 0; k < {n}; ++k) {{
+            float2 w = Wt[f * {n} + k];
+            ar = metal::fma(xr[k], w.x, metal::fma(-xi[k], w.y, ar));
+            ai = metal::fma(xr[k], w.y, metal::fma(xi[k], w.x, ai));
+        }}
+        size_t it = (size_t)f * {n2} + k2;
+        float tr = T[it].real, ti = T[it].imag;
+        size_t o = base + (size_t)f * {R};
+        Yf[2*o] = ar * tr - ai * ti; Yf[2*o+1] = ar * ti + ai * tr;
+    }}
+"""
+    k = mx.fast.metal_kernel(
+        name=f"nufft_dfttw{n}_r{R}_n{nt}_t{Rt}x{n2}", input_names=["X", "W", "T"],
+        output_names=["Y"], source=src)
+    _dft_tw_kernels[key] = k
+    return k
+
+
+_dft_tw_kernels = {}
+
+
+def _twiddle_table_dft(n, n1, n2, inverse, cache):
+    """T[f1, k2] = exp(sgn 2 pi i f1 k2 / n) as an (n1, n2) complex64 table
+    for the dense-DFT four-step; cached by (n, sgn, "dft")."""
+    sgn = +1.0 if inverse else -1.0
+    key = (n, sgn, "dft")
+    if cache is not None and key in cache:
+        return cache[key]
+    f1 = np.arange(n1, dtype=np.float64)[:, None]
+    k2 = np.arange(n2, dtype=np.float64)[None, :]
+    T = mx.array(np.exp(sgn * 2j * PI * f1 * k2 / n).astype(np.complex64))
+    if cache is not None:
+        cache[key] = T
+    return T
+
+
 def _dft_small(H, axis, inverse, twiddle_cache):
     """Dense DFT along `axis` of the row-contiguous H (any position), same
     shape and layout out."""
@@ -486,12 +575,42 @@ def _four_step(H, axis, inverse, twiddle_cache, scrambled):
     """
     n = H.shape[axis]
     fft1 = mx.fft.ifft if inverse else mx.fft.fft
-    n1, n2 = _split_n(n)
-    T = _twiddle_table(n, inverse, twiddle_cache)
     shp = list(H.shape)
     lead = shp[:axis]
     rest = shp[axis + 1:]
     L, R = int(np.prod(lead)), int(np.prod(rest))
+    dft = _split_dft(n)
+    if dft is not None and L * n * R <= _MK_MAX_ELEMS:
+        # stage 1 in place: the n1-point DFT over the strided k1 run of
+        # every (l, k2, r) column, twiddled; then k2 to the last position
+        # (free when R == 1) for the native n2-point FFT. 2 passes on a
+        # last axis (3 un-scrambled), 4 on a middle axis, against the
+        # transpose-FFT-twiddle-FFT(-transpose) 4 and 5 of the balanced
+        # split.
+        n1, n2 = dft
+        nt = L * n2 * R
+        A = _dft_tw_kernel(n1, n2 * R, nt, R, n2)(
+            inputs=[H, _dft_table(n1, inverse, twiddle_cache),
+                    _twiddle_table_dft(n, n1, n2, inverse, twiddle_cache)],
+            output_shapes=[(L * n1 * n2 * R,)], output_dtypes=[mx.complex64],
+            grid=(-(-nt // _DFT_TG) * _DFT_TG, 1, 1),
+            threadgroup=(_DFT_TG, 1, 1))[0]            # (L, f1, k2, R)
+        if R == 1:
+            B = A.reshape(L * n1, n2)
+        else:
+            B = _tiled_permute(A, (L, n1, R, n2),
+                               (n1 * n2 * R, n2 * R, 1, R))   # (L, f1, R, k2)
+            del A
+        C = fft1(B.reshape(-1, n2), axis=-1)                 # k2 -> f2
+        del B
+        if scrambled:
+            return C.reshape(*lead, n, *rest), (n1, n2)
+        X = _tiled_permute(C.reshape(L, n1, R, n2), (L, n2, n1, R),
+                           (n1 * R * n2, 1, R * n2, n2))     # (L, f2, f1, R)
+        del C
+        return X.reshape(*lead, n, *rest)
+    n1, n2 = _split_n(n)
+    T = _twiddle_table(n, inverse, twiddle_cache)
     tiled = _strategy(shp) == "transpose"
     # T1: (L, n1, n2, R) -> (L, n2, R, n1), k1 unit-stride
     if tiled:
@@ -963,7 +1082,7 @@ class GpuT3Plan:
         def _scram(n):
             if n <= _FFT_NATIVE_MAX or (n & (n - 1)) == 0:
                 return (1, n)
-            return _split_n(n)
+            return _split_axis(n)
 
         # slab-mode lateral FFTs skip their final un-scramble transpose;
         # the gather kernel absorbs the separable index permutation
@@ -2259,6 +2378,17 @@ class GpuT3Plan:
         inv = self.isign > 0
         fft1 = mx.fft.ifft if inv else mx.fft.fft
         n1B, n2B = self._scrB_full
+        if (n2B == 1 or _split_dft(nu2) is not None) and \
+                (_is_native(nu1) or _split_dft(nu1) is not None):
+            # dense-DFT four-steps (see _four_step): axis 2 scrambled in 2
+            # passes, axis 1 natural in 4, with nu2 kept as the trailing
+            # dim; 6 passes against the balanced split's 9
+            X = Z.reshape(nl, nu1, nu2)
+            X, _ = fft_axis_scrambled(X, 2, inv, self._twiddles)
+            mx.eval(X)
+            X = fft_axis(X, 1, inv, self._twiddles)
+            mx.eval(X)
+            return X.reshape(nl, nu1, nu2)
 
         def _twt(X, L, n1, n2, R, n):
             return self._get_twt(n1, n2, R)(
