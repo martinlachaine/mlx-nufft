@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Type-3 plans compute their target-side arrays (cell indices, offsets, and the phase-and-deconvolution factor per target) in chunks on a thread pool. The results are bit-identical to one pass (`harness/test_t3_plan_chunks.py`). On an M5 Max, a plan with 4.19M targets builds in 0.068 s instead of 0.213 s, which had been three times FINUFFT's own type-3 plan and the larger part of a one-shot transform.
+- `harness/run_acceptance.py` times FINUFFT through its plan interface, so the type-3 speedup compares the GPU execute with FINUFFT's execute. It used to divide a complete `nufft3d3` call, plan and sorting included, by the GPU execute alone. Both sides now build and execute a plan three times and then execute the last plan three more times, and `speedup_total` compares plan construction plus a first execute on both sides. Peak memory is now measured per configuration rather than as a running maximum over the run.
+
 ## v0.3.2 - 2026-09-26
 
 - The 3D upsampling default now accounts for point density, the points per cell of the sigma=2 grid. At high density the sigma=1.25 grid packs about four times more points per cell and spreading contends, so type 1 at eps=1e-3 ran 0.67x as fast as with sigma=2 at density 1 on an M5 Max. Type 1 now takes sigma=1.25 only below density 0.1, and type 2 at eps=1e-4 only below 0.3; type 2 at eps=1e-3 and looser keeps sigma=1.25 at every density, where it is 1.15x to 1.89x faster. Low-density plans, where the gains of v0.3.0 were measured, are unchanged.

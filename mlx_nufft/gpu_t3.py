@@ -51,6 +51,25 @@ _FFT_POW2_MAX = 2 ** 20   # mlx 0.31.2: pow2 lengths above this hit a missing
                           # own four-step split instead (needed for 1D NUFFTs)
 _SLAB_THRESHOLD = 3e9
 
+
+_CHUNK = 1 << 18                     # targets per host setup chunk (smaller
+                                     # chunks lose the gain to GIL contention)
+_POOL = None
+
+
+def _chunked(fn, n):
+    """Run fn(slice) over [0, n) in chunks of _CHUNK on a shared thread pool.
+    Small problems take one call on the calling thread."""
+    global _POOL
+    if n <= _CHUNK:
+        fn(slice(0, n))
+        return
+    if _POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _POOL = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+    list(_POOL.map(fn, [slice(a, min(a + _CHUNK, n)) for a in range(0, n, _CHUNK)]))
+
+
 # ---- FFT path switches (perf A/B; correctness in harness/test_fft_paths.py)
 # Each is read at call time, so it can be flipped on the module between runs;
 # the MLX_NUFFT_* environment variables set the process-wide default (for
@@ -816,29 +835,13 @@ class GpuT3Plan:
         else:
             self._xext = [(float(x64[d].min()), float(x64[d].max()))
                           for d in range(3)]
-        ss = [v.astype(rdt) for v in s64]
-
-        self.t_i1, self.t_fr = [], []
-        theta64 = []
-        for d in range(3):
-            hd = 2.0 * PI / self.nf[d]
-            th = (ss[d] - rdt(self.D[d])) * rdt(hd * self.gam[d])
-            theta64.append(th.astype(np.float64))
-            lam = th / rdt(2.0 * PI / self.n_up[d]) + rdt(self.n_up[d] / 2.0)
-            ii = np.ceil(lam - rdt(self.w2 / 2.0)).astype(np.int32)
-            self.t_i1.append(ii)
-            self.t_fr.append((lam - ii.astype(rdt)).astype(np.float32))
-
-        sp = [v.astype(pdt) for v in s64]
-        post_ang = sum(pdt(self.C[d]) * (sp[d] - pdt(self.D[d]))
-                       for d in range(3))
-        postphase = np.exp(1j * self.isign * post_ang.astype(np.float64))
-
-        # ---- deconvolution (host fp64) ------------------------------------
-        tdec = np.ones(self.M, dtype=np.float64)
-        for d in range(3):
-            tdec *= kernel_ft_fast(theta64[d], self.beta, w)
-        post = (postphase / tdec).astype(np.complex64)
+        # target cells, offsets, phases and deconvolution (host fp64): every
+        # operation is elementwise, so contiguous chunks run on a thread pool
+        # (numpy releases the GIL) and give the same bits as one pass
+        self.t_i1 = [np.empty(self.M, dtype=np.int32) for _ in range(3)]
+        self.t_fr = [np.empty(self.M, dtype=np.float32) for _ in range(3)]
+        post = np.empty(self.M, dtype=np.complex64)
+        _chunked(lambda sl: self._target_chunk(s64, sl, post), self.M)
 
         decs = []
         for d in range(3):
@@ -870,9 +873,7 @@ class GpuT3Plan:
         # ---- upload frozen target-side plan arrays to mx ------------------
         self.mx_ti1 = [mx.array(v) for v in self.t_i1]
         self.mx_tfr = [mx.array(v) for v in self.t_fr]
-        self.mx_post = mx.array(np.ascontiguousarray(
-            np.stack([post.real.astype(np.float32),
-                      post.imag.astype(np.float32)], axis=-1)))
+        self.mx_post = mx.array(post.view(np.float32).reshape(self.M, 2))
         self.mx_dec = [mx.array(v.astype(np.float32)) for v in decs]
         self.mx_tw = None if self._tw_np is None else mx.array(
             np.ascontiguousarray(
@@ -924,6 +925,28 @@ class GpuT3Plan:
         # (self.perm/i1/fr) stay unmaterialized on the gpu path — call
         # set_sources(x, backend="host") to rebuild them if needed.
         self.set_sources(x, backend="gpu" if prec == "crit64" else "host")
+
+    # ------------------------------------------------------------------
+    def _target_chunk(self, s64, sl, post):
+        """Target-side plan arrays for the targets in slice sl (see __init__)."""
+        rdt, pdt = self._rdt, self._pdt
+        theta64 = []
+        for d in range(3):
+            sd = s64[d][sl].astype(rdt)
+            hd = 2.0 * PI / self.nf[d]
+            th = (sd - rdt(self.D[d])) * rdt(hd * self.gam[d])
+            theta64.append(th.astype(np.float64))
+            lam = th / rdt(2.0 * PI / self.n_up[d]) + rdt(self.n_up[d] / 2.0)
+            ii = np.ceil(lam - rdt(self.w2 / 2.0)).astype(np.int32)
+            self.t_i1[d][sl] = ii
+            self.t_fr[d][sl] = (lam - ii.astype(rdt)).astype(np.float32)
+        post_ang = sum(pdt(self.C[d]) * (s64[d][sl].astype(pdt) - pdt(self.D[d]))
+                       for d in range(3))
+        postphase = np.exp(1j * self.isign * post_ang.astype(np.float64))
+        tdec = np.ones(postphase.size, dtype=np.float64)
+        for d in range(3):
+            tdec *= kernel_ft_fast(theta64[d], self.beta, self.w)
+        post[sl] = (postphase / tdec).astype(np.complex64)
 
     # ------------------------------------------------------------------
     def _prepare_od_targets(self):

@@ -7,6 +7,9 @@ Regenerates the full acceptance table:
   - GPU crit64 at eps=1e-5; accuracy vs exact fp64 direct-sum subset oracle
   - CPU FINUFFT fp64 timed wherever its predicted internal grids fit in RAM;
     feasibility statement where they do not
+  - both sides build the plan and execute it once, three times over, then
+    execute the last plan three more times; minimum of each: speedup is the
+    repeated execute, speedup_total the plan plus its first execute
   - adjoint/convention self-tests
 Writes results/acceptance.json and prints a markdown table.
 
@@ -115,10 +118,24 @@ def run_config(geom, N, P):
     eps = EPS_BY_GEOM[geom]
     fd, idx = oracle(tag, x, c, s, M)
 
-    t0 = time.perf_counter()
-    plan = Type3Plan(x, s, eps=eps, isign=+1, prec="crit64")
-    t_plan = time.perf_counter() - t0
-    f_gpu = plan.execute(c)            # warm
+    # GPU and CPU are timed alike. Three times, the previous plan is freed, a
+    # new one is built and executed once, which is what a new geometry costs
+    # in a running process; the last plan then executes three more times. The
+    # minimum of each is reported: speedup compares the repeated execute,
+    # speedup_total the plan plus its first execute. The first build starts
+    # from an empty MLX buffer cache and is kept as t_total_cold.
+    t_plans, t_tots, plan = [], [], None
+    mx.clear_cache()
+    for k in range(3):
+        plan = None
+        if k == 2:
+            mx.reset_peak_memory()      # peak covers one build and its executes
+        t0 = time.perf_counter()
+        plan = Type3Plan(x, s, eps=eps, isign=+1, prec="crit64")
+        t1 = time.perf_counter()
+        f_gpu = plan.execute(c)
+        t_plans.append(t1 - t0)
+        t_tots.append(time.perf_counter() - t0)
     ts = []
     for _ in range(3):
         mx.synchronize()
@@ -129,7 +146,9 @@ def run_config(geom, N, P):
     e_gpu = rel_l2(f_gpu[idx], fd)
     row = dict(geom=geom, N=N, P=P, M=int(M), eps=eps, prec="crit64",
                nf=plan.nf, n_up=plan.n_up, slab=bool(plan.slab_mode),
-               t_plan=t_plan, t_gpu=min(ts), rel_l2=e_gpu, peak_gib=peak)
+               t_plan=min(t_plans), t_plan_first=t_plans[0], t_total=min(t_tots),
+               t_total_cold=t_tots[0],
+               t_gpu=min(ts), rel_l2=e_gpu, peak_gib=peak)
     del plan
     mx.clear_cache()
 
@@ -138,21 +157,37 @@ def run_config(geom, N, P):
     # (9 GiB was the 16 GB mini's number; a 128 GB machine can afford the
     # anisotropic cases' ~13 GiB and gets their CPU timings)
     if pred < 0.5 * machine_ram_gib():
-        ts_c = []
-        f_cpu = None
-        for _ in range(2):
+        ts_cp, ts_ct, ts_c, cp = [], [], [], None
+        for _ in range(3):
+            cp = None
             t0 = time.perf_counter()
-            f_cpu = finufft.nufft3d3(*x, c, *s, isign=+1, eps=eps)
+            cp = finufft.Plan(3, 3, eps=eps, isign=+1)
+            cp.setpts(*x, *s)
+            t1 = time.perf_counter()
+            f_cpu = cp.execute(c)
+            ts_cp.append(t1 - t0)
+            ts_ct.append(time.perf_counter() - t0)
+        for _ in range(3):
+            t0 = time.perf_counter()
+            f_cpu = cp.execute(c)
             ts_c.append(time.perf_counter() - t0)
-        row.update(t_cpu=min(ts_c), rel_l2_cpu=rel_l2(f_cpu[idx], fd),
-                   speedup=min(ts_c) / min(ts), cpu_pred_gib=pred)
+        del cp
+        row.update(t_cpu=min(ts_c), t_cpu_plan=min(ts_cp), t_cpu_total=min(ts_ct),
+                   rel_l2_cpu=rel_l2(f_cpu[idx], fd),
+                   speedup=min(ts_c) / min(ts),
+                   speedup_total=min(ts_ct) / min(t_tots),
+                   cpu_pred_gib=pred)
         del f_cpu
     else:
         row.update(t_cpu=None, cpu_pred_gib=pred,
                    cpu_note=f"fp64 grids ~{pred:.1f} GiB exceed the "
                             "CPU-oracle memory threshold")
-    print(f"    gpu {min(ts):.2f}s rel_l2 {e_gpu:.2e} peak {peak:.1f} GiB"
-          + (f"  cpu {row['t_cpu']:.2f}s ({row['speedup']:.2f}x)"
+    print(f"    gpu plan {min(t_plans):.3f}s total {min(t_tots):.3f}s exec {min(ts):.3f}s "
+          f"rel_l2 {e_gpu:.2e} "
+          f"peak {peak:.1f} GiB"
+          + (f"  cpu plan {row['t_cpu_plan']:.3f}s total {row['t_cpu_total']:.3f}s "
+             f"exec {row['t_cpu']:.3f}s "
+             f"(exec {row['speedup']:.2f}x, total {row['speedup_total']:.2f}x)"
              if row.get("t_cpu") else f"  cpu N/A ({pred:.1f} GiB)"),
           flush=True)
     return row
@@ -221,15 +256,16 @@ if __name__ == "__main__":
 
     # markdown table
     print("\n| geometry | N (M=N^2) | P | eps | rel-L2 (gate 1e-4) | "
-          "GPU s | CPU fp64 s | speedup | peak GiB |")
-    print("|---|---|---|---|---|---|---|---|---|")
+          "GPU exec s | CPU fp64 exec s | speedup exec | speedup total | peak GiB |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for r in rows:
         cpu = f"{r['t_cpu']:.2f}" if r.get("t_cpu") else \
             f"N/A ({r['cpu_pred_gib']:.0f} GiB)"
         sp = f"{r['speedup']:.2f}x" if r.get("t_cpu") else "—"
+        spt = f"{r['speedup_total']:.2f}x" if r.get("t_cpu") else "—"
         ok = "PASS" if r["rel_l2"] <= 1e-4 else "FAIL"
         print(f"| {r['geom']} | {r['N']} | {r['P']:.0e} | "
               f"{r['eps']:.0e} | "
-              f"{r['rel_l2']:.2e} {ok} | {r['t_gpu']:.2f} | {cpu} | {sp} | "
+              f"{r['rel_l2']:.2e} {ok} | {r['t_gpu']:.3f} | {cpu} | {sp} | {spt} | "
               f"{r['peak_gib']:.1f} |")
     print("\nsaved results/acceptance.json", flush=True)
