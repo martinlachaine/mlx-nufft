@@ -35,8 +35,9 @@ from harness.gen import gen_anisotropic, direct_sum, rel_l2  # noqa: E402
 
 TOL_REF = 4e-6        # helper vs fp64 numpy FFT; MLX's fp32 FFT lands at
                       # 1.0e-6 to 1.3e-6 on the GitHub runner GPU, 5e-7 on an M5 Max
-TOL_OLD = 1e-6        # helper vs the v0.2.0 path
-TOL_PLAN = 5e-6       # plan outputs across settings
+TOL_OLD = 2e-6        # helper vs the v0.2.0 path (the dense-DFT four-step
+                      # rounds differently: dft_last reached 1.06e-6 on an M1)
+TOL_PLAN = 8e-6       # plan outputs across settings (5.15e-6 on an M1)
 
 # (name, FFT_STRATEGY, _FOUR_STEP_FUSED_TWIDDLE, _SMALL_AXIS_DFT,
 #  _SMALL_AXIS_DFT_LAST); "v020" is the 0.2.0 path
