@@ -15,11 +15,8 @@ precision-critical coordinate setup performed in double precision at plan time
 ("crit64"), so it reaches fp64-grade accuracy on hardware that has no native
 double precision.
 
-> **Technical report (v0.1):** [`mlx-nufft.pdf`](mlx-nufft.pdf) describes the
-> method, the crit64 precision mechanism, and the M1 / M5 Max benchmarks of the
-> original implementation. Its performance figures predate the v0.2 and v0.3
-> speedups; see [REPORT.md](REPORT.md) and the [changelog](CHANGELOG.md) for
-> current numbers. A revised report is in preparation.
+> **Technical report:** [`mlx-nufft.pdf`](mlx-nufft.pdf) describes the method,
+> the crit64 precision mechanism, and the M1 / M5 Max benchmarks of release 0.3.3.
 > Pin a tagged release rather than tracking `main`.
 
 ## Install
